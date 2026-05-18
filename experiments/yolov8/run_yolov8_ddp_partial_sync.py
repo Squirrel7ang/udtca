@@ -1,10 +1,13 @@
 import argparse
+import csv
+import json
 import math
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -326,6 +329,28 @@ def ensure_detection_hyp(model) -> None:
         criterion.hyp = _normalize_hyp(getattr(criterion, "hyp", None), fallback_args=hyp)
 
 
+def init_run_dir(log_dir: str, run_name: str, rank: int) -> Optional[Path]:
+    if rank != 0:
+        return None
+    base = Path(log_dir).expanduser()
+    run_id = f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = base / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def extract_detection_metric(results) -> Optional[float]:
+    for attr in ("metrics", "box"):
+        value = getattr(results, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, dict) and "map" in value:
+            return float(value["map"])
+        if hasattr(value, "map"):
+            return float(value.map)
+    return None
+
+
 def infinite_loader(loader: DataLoader) -> Iterable[Tuple[torch.Tensor, torch.Tensor]]:
     while True:
         for batch in loader:
@@ -373,6 +398,44 @@ def sync_bucket(
         offset += numel
 
 
+@dataclass
+class PendingSync:
+    work: dist.Work
+    flat: torch.Tensor
+    bucket: List[torch.nn.Parameter]
+
+
+def launch_bucket_sync(
+    *,
+    bucket: List[torch.nn.Parameter],
+    residuals: Dict[torch.nn.Parameter, torch.Tensor],
+    group,
+) -> Optional[PendingSync]:
+    flat = torch.cat([residuals[p].view(-1) for p in bucket], dim=0)
+    if flat.numel() == 0:
+        return None
+    work = dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group, async_op=True)
+    return PendingSync(work=work, flat=flat, bucket=bucket)
+
+
+def finish_bucket_sync(
+    *,
+    pending: PendingSync,
+    residuals: Dict[torch.nn.Parameter, torch.Tensor],
+    synced: Dict[torch.nn.Parameter, torch.Tensor],
+    world_size: int,
+) -> None:
+    pending.work.wait()
+    pending.flat.div_(world_size)
+
+    offset = 0
+    for param in pending.bucket:
+        numel = param.numel()
+        synced[param].copy_(pending.flat[offset : offset + numel].view_as(param))
+        residuals[param].zero_()
+        offset += numel
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="YOLOv8 DDP partial-gradient sync training")
     parser.add_argument("--model", type=str, default="yolov8n-cls.pt")
@@ -389,6 +452,10 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--no-scale-loss", action="store_true")
+    parser.add_argument("--log-dir", type=str, default="experiments/yolov8/outputs")
+    parser.add_argument("--run-name", type=str, default="partial")
+    parser.add_argument("--no-eval", action="store_true")
+    parser.add_argument("--eval-steps", type=int, default=10)
     parser.add_argument(
         "--task",
         type=str,
@@ -403,6 +470,10 @@ def main() -> None:
 
     rank, world_size, local_rank = init_distributed()
     device = torch.device(f"cuda:{local_rank}")
+
+    run_dir = init_run_dir(args.log_dir, args.run_name, rank)
+    loss_history: List[Tuple[int, float, float]] = []
+    final_accuracy: Optional[float] = None
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -506,6 +577,9 @@ def main() -> None:
     start_time = time.time()
 
     synced_in_cycle = [False for _ in buckets]
+    pending_by_bucket: Dict[int, PendingSync] = {}
+    last_batch_correct: Optional[torch.Tensor] = None
+    last_batch_total: Optional[torch.Tensor] = None
 
     for micro_step in range(1, total_micro_steps + 1):
         cycle_step = (micro_step - 1) % args.sync_interval
@@ -535,6 +609,9 @@ def main() -> None:
             with ddp_model.no_sync():
                 logits = ddp_model(images)
                 loss = criterion(logits, labels)
+                preds = logits.argmax(dim=1)
+                last_batch_correct = (preds == labels).sum().to(torch.float32)
+                last_batch_total = torch.tensor(float(labels.numel()), device=device)
                 raw_loss = loss.detach()
                 if not args.no_scale_loss:
                     loss = loss / float(args.sync_interval)
@@ -550,16 +627,32 @@ def main() -> None:
         for bucket_idx, bucket in enumerate(buckets):
             if bucket_idx % args.sync_interval != cycle_step:
                 continue
-            sync_bucket(
+            pending = pending_by_bucket.pop(bucket_idx, None)
+            if pending is not None:
+                finish_bucket_sync(
+                    pending=pending,
+                    residuals=residuals,
+                    synced=synced,
+                    world_size=world_size,
+                )
+            pending = launch_bucket_sync(
                 bucket=bucket,
                 residuals=residuals,
-                synced=synced,
-                world_size=world_size,
                 group=dist.group.WORLD,
             )
+            if pending is not None:
+                pending_by_bucket[bucket_idx] = pending
             synced_in_cycle[bucket_idx] = True
 
         if cycle_step == args.sync_interval - 1:
+            for pending in list(pending_by_bucket.values()):
+                finish_bucket_sync(
+                    pending=pending,
+                    residuals=residuals,
+                    synced=synced,
+                    world_size=world_size,
+                )
+            pending_by_bucket.clear()
             missing = sum(1 for was_synced in synced_in_cycle if not was_synced)
             if rank == 0 and missing:
                 print(
@@ -583,8 +676,13 @@ def main() -> None:
                 loss_scalar = raw_loss.to(torch.float32)
                 dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM)
                 loss_scalar.div_(world_size)
+                if task == "classify" and last_batch_correct is not None and last_batch_total is not None:
+                    acc_tensor = torch.stack([last_batch_correct, last_batch_total])
+                    dist.all_reduce(acc_tensor, op=dist.ReduceOp.SUM)
+                    final_accuracy = float((acc_tensor[0] / acc_tensor[1]).item())
                 if rank == 0:
                     elapsed = time.time() - start_time
+                    loss_history.append((update_step, float(loss_scalar.item()), elapsed))
                     print(
                         f"[update {update_step}/{args.steps}] "
                         f"loss={loss_scalar.item():.4f} elapsed={elapsed:.1f}s"
@@ -593,6 +691,42 @@ def main() -> None:
     if rank == 0:
         total_time = time.time() - start_time
         print(f"[done] updates={update_step} total_time={total_time:.1f}s")
+
+        if task == "detect" and not args.no_eval:
+            try:
+                yolo.model = ddp_model.module
+                yolo.model.eval()
+                results = yolo.val(
+                    data=args.data,
+                    imgsz=args.imgsz,
+                    batch=args.batch_size,
+                    device=0,
+                    verbose=False,
+                    plots=False,
+                )
+                final_accuracy = extract_detection_metric(results)
+            except Exception as exc:
+                print(f"[warn] detection eval failed: {exc}")
+
+        if run_dir is not None:
+            loss_path = run_dir / "loss_curve.csv"
+            with loss_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["step", "loss", "elapsed_s"])
+                writer.writerows(loss_history)
+
+            summary = {
+                "run_name": args.run_name,
+                "task": task,
+                "steps": args.steps,
+                "sync_interval": args.sync_interval,
+                "total_time_s": total_time,
+                "final_loss": loss_history[-1][1] if loss_history else None,
+                "final_accuracy": final_accuracy,
+            }
+            summary_path = run_dir / "summary.json"
+            with summary_path.open("w", encoding="utf-8") as handle:
+                json.dump(summary, handle, indent=2)
 
     dist.barrier()
     dist.destroy_process_group()
