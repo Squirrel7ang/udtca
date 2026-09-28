@@ -214,69 +214,61 @@ print(torch.__version__); print(bitscom.__file__); print(psgd.__file__)"
 
 两边的 `torch.__version__` 要一样，`bitscom` / `psgd` 指向的 commit 也要一样。
 
-### 1.8 环境变量：两台机器的 `~/.bashrc`
+### 1.8 环境变量（必设）
 
-Corex 相关的环境变量写在 **`/root/.bashrc`** 里，**两台机器必须设成一样**，
-否则编译和运行都会出问题（典型症状：编译时找不到 `nvcc`/头文件，或者运行时
-`libcorex.so` 加载不到）。
-
-**u62 的 `~/.bashrc` 末尾：**
+在**每个**节点的 `/root/.bashrc` 末尾加上下面这一段。装了 Corex 的机器上
+`torch` / `bitscom` / `flash_attn` 这些包都依赖它，缺一个就会在编译或 import
+的时候炸。
 
 ```bash
-# Corex 4.4.0 Environment for Megatron-LM
+# ---- Corex 4.4.0 ----
 export COREX_PATH=/usr/local/corex-4.4.0
+export CUDA_HOME=$COREX_PATH
 export CPATH=$COREX_PATH/include:$CPATH
 export LIBRARY_PATH=$COREX_PATH/lib64:$LIBRARY_PATH
 export LD_LIBRARY_PATH=$COREX_PATH/lib64:$LD_LIBRARY_PATH
 
-# Triton Specific
+# Triton 编 kernel 用的 sysroot
 export TRITON_CUDA_SYSROOT=$COREX_PATH
 
-# Training Optimization
+# 训练侧优化
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-export CUDA_HOME=/usr/local/corex-4.4.0
-export BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++
-export HF_ENDPOINT=https://hf-mirror.com
-```
+# bitscom 编译扩展时用 Corex 的 clang++，不设会去找 nvcc 然后失败
+export BITSCOM_CUDA_COMPILER=$COREX_PATH/bin/clang++
 
-**u210 的 `~/.bashrc`** 里也有 Corex 相关设置，但**内容不一样**：
-
-```bash
-export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH
-export LD_LIBRARY_PATH=/usr/local/corex/lib64
-export PATH=/usr/local/corex/bin:$PATH
-export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package
-export PATH=/usr/local/corex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
+# 走 HF 镜像，不需要代理
 export HF_ENDPOINT=https://hf-mirror.com
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
-
-export CUDA_HOME=/usr/local/corex-4.4.0
-export BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++
 ```
 
-**两台的关键差异：**
+各变量的作用：
 
-| 变量 | u62 | u210 | 作用 |
-|---|---|---|---|
-| `COREX_PATH` | ✅ | ❌ 缺 | Corex 安装根目录，`CPATH` 等都基于它 |
-| `CPATH` | ✅ | ❌ 缺 | 编译扩展时找头文件 |
-| `LIBRARY_PATH` | ✅ | ❌ 缺 | **链接期**找库，缺了会报 `cannot find -lnccl` |
-| `TRITON_CUDA_SYSROOT` | ✅ | ❌ 缺 | Triton 编 kernel 用的 sysroot |
-| `CUDA_DEVICE_MAX_CONNECTIONS=1` | ✅ | ❌ 缺 | 训练性能相关 |
-| `PYTHONPATH` | ❌ 缺 | ✅ | 指向 corex 的 dist-package |
-| `LD_LIBRARY_PATH` | ✅ | ✅ | 运行期加载 corex 动态库 |
+| 变量 | 作用 |
+|---|---|
+| `COREX_PATH` / `CUDA_HOME` | Corex 安装根目录，下面几个都基于它 |
+| `CPATH` | 编译扩展时找头文件 |
+| `LIBRARY_PATH` | **链接期**找库；不设会报 `cannot find -lnccl` |
+| `LD_LIBRARY_PATH` | 运行期加载 Corex 动态库 |
+| `TRITON_CUDA_SYSROOT` | Triton 编 kernel 的 sysroot |
+| `CUDA_DEVICE_MAX_CONNECTIONS` | 训练性能相关 |
+| `BITSCOM_CUDA_COMPILER` | bitscom 编译扩展用这个编译器 |
+| `HF_ENDPOINT` | 用 HuggingFace 镜像拉模型/数据集 |
 
-> **`ssh u210` 是非交互 shell，默认不 source `~/.bashrc`**，所以上面这些在远程
-> 直接 `ssh` 过去是**不会有**的。另外 u62 那份 `.bashrc` 开头有
-> `[ -z "$PS1" ] && return` 之类的非交互保护，直接 `source` 也会提前返回。
+改完让当前 shell 生效：
+
+```bash
+source ~/.bashrc
+```
+
+> **`ssh <host> <cmd>` 是非交互 shell，不会 source `~/.bashrc`**，所以远程直接
+> 执行命令时上面这些变量是不存在的。而且 `.bashrc` 开头通常有
+> `[ -z "$PS1" ] && return` 这类非交互保护，直接 `. ~/.bashrc` 也会提前返回。
 >
-> 走 `udtca-config` 不用管这些：`case_common.SETUP_CMDS` 会先绕过保护 source 一遍
-> `~/.bashrc`，再把上表里 u62 有、u210 没有的那几个变量**在两边显式补齐**，
-> 保证两个节点环境一致。
+> 用 `udtca-config` 跑实验不用管这点：`case_common.SETUP_CMDS` 会绕过保护先
+> source 一遍 `~/.bashrc`，再把上面这些变量在两个节点上**显式补齐**，保证两边一致。
 >
-> 手工在 u210 上跑实验时，记得先 `. ~/.bashrc`，或者按上表把缺的变量 export 一遍。
+> 手工 `ssh` 过去跑实验时，先 `. ~/.bashrc`，或者手动 export 一遍。
 
 ---
 
@@ -355,12 +347,11 @@ MASTER_ADDR=10.31.10.62 bash experiments/qwen14b/1_train_qwen14b_polar_dp_pp_tp.
 > - 在 u210 上，`ssh u210` 是**非交互 shell**，默认什么都不 source，
 >   需要在跑之前 `. ~/.bashrc`，或者自己把那一组 Corex 变量 export 一遍。
 >
-> 上面这组变量两台机器的 `~/.bashrc` 里都有，但**内容不一样**，
-> 明细见 [1.8 环境变量](#18-环境变量两台机器的-bashrc)。
+> 这些变量就是 [1.8 节](#18-环境变量必设)要求写进 `~/.bashrc` 的那一组。
 >
 > 走 `udtca-config` 时不用操心：编排器会把两台机器的环境对齐
-> （`case_common.SETUP_CMDS` 里先强制 source 一遍 `~/.bashrc`，再把 u62 有、
-> u210 缺的那几个 Corex 变量显式补齐）。
+> （`case_common.SETUP_CMDS` 里先强制 source 一遍 `~/.bashrc`，再把这一组变量
+> 在两个节点上显式补齐）。
 
 ### 2.4 限速
 
