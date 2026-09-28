@@ -92,9 +92,9 @@ polar-sgd 版本不一致，通信后端的行为会对不上。核对方法（�
 
 ```bash
 git submodule status
-# 每行形如： 482e56d... bitscom (heads/main)
-#           47dbe75... polar-sgd (heads/main)
-#           f0937c3... udtca-config (heads/master)
+# 每行形如： <hash> bitscom (heads/main)
+#           <hash> polar-sgd (heads/main)
+#           <hash> udtca-config (heads/master)
 ```
 
 > 行首的符号：空格 = 已就位且与主库记录一致；`+` = 检出的 commit 和主库记录的
@@ -214,6 +214,70 @@ print(torch.__version__); print(bitscom.__file__); print(psgd.__file__)"
 
 两边的 `torch.__version__` 要一样，`bitscom` / `psgd` 指向的 commit 也要一样。
 
+### 1.8 环境变量：两台机器的 `~/.bashrc`
+
+Corex 相关的环境变量写在 **`/root/.bashrc`** 里，**两台机器必须设成一样**，
+否则编译和运行都会出问题（典型症状：编译时找不到 `nvcc`/头文件，或者运行时
+`libcorex.so` 加载不到）。
+
+**u62 的 `~/.bashrc` 末尾：**
+
+```bash
+# Corex 4.4.0 Environment for Megatron-LM
+export COREX_PATH=/usr/local/corex-4.4.0
+export CPATH=$COREX_PATH/include:$CPATH
+export LIBRARY_PATH=$COREX_PATH/lib64:$LIBRARY_PATH
+export LD_LIBRARY_PATH=$COREX_PATH/lib64:$LD_LIBRARY_PATH
+
+# Triton Specific
+export TRITON_CUDA_SYSROOT=$COREX_PATH
+
+# Training Optimization
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+export CUDA_HOME=/usr/local/corex-4.4.0
+export BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+**u210 的 `~/.bashrc`** 里也有 Corex 相关设置，但**内容不一样**：
+
+```bash
+export PATH=/usr/local/corex/bin:/usr/local/corex/lib64/python3/dist-packages/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/corex/lib64
+export PATH=/usr/local/corex/bin:$PATH
+export PYTHONPATH=/usr/local/corex/lib64/python3/dist-package
+export PATH=/usr/local/corex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+export HF_ENDPOINT=https://hf-mirror.com
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+
+export CUDA_HOME=/usr/local/corex-4.4.0
+export BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++
+```
+
+**两台的关键差异：**
+
+| 变量 | u62 | u210 | 作用 |
+|---|---|---|---|
+| `COREX_PATH` | ✅ | ❌ 缺 | Corex 安装根目录，`CPATH` 等都基于它 |
+| `CPATH` | ✅ | ❌ 缺 | 编译扩展时找头文件 |
+| `LIBRARY_PATH` | ✅ | ❌ 缺 | **链接期**找库，缺了会报 `cannot find -lnccl` |
+| `TRITON_CUDA_SYSROOT` | ✅ | ❌ 缺 | Triton 编 kernel 用的 sysroot |
+| `CUDA_DEVICE_MAX_CONNECTIONS=1` | ✅ | ❌ 缺 | 训练性能相关 |
+| `PYTHONPATH` | ❌ 缺 | ✅ | 指向 corex 的 dist-package |
+| `LD_LIBRARY_PATH` | ✅ | ✅ | 运行期加载 corex 动态库 |
+
+> **`ssh u210` 是非交互 shell，默认不 source `~/.bashrc`**，所以上面这些在远程
+> 直接 `ssh` 过去是**不会有**的。另外 u62 那份 `.bashrc` 开头有
+> `[ -z "$PS1" ] && return` 之类的非交互保护，直接 `source` 也会提前返回。
+>
+> 走 `udtca-config` 不用管这些：`case_common.SETUP_CMDS` 会先绕过保护 source 一遍
+> `~/.bashrc`，再把上表里 u62 有、u210 没有的那几个变量**在两边显式补齐**，
+> 保证两个节点环境一致。
+>
+> 手工在 u210 上跑实验时，记得先 `. ~/.bashrc`，或者按上表把缺的变量 export 一遍。
+
 ---
 
 ## 2. 手工跑一个 Qwen14B 实验
@@ -291,9 +355,12 @@ MASTER_ADDR=10.31.10.62 bash experiments/qwen14b/1_train_qwen14b_polar_dp_pp_tp.
 > - 在 u210 上，`ssh u210` 是**非交互 shell**，默认什么都不 source，
 >   需要在跑之前 `. ~/.bashrc`，或者自己把那一组 Corex 变量 export 一遍。
 >
-> 走 `udtca-config` 时不用操心这些：编排器会把两台机器的环境对齐
-> （`case_common.SETUP_CMDS` 里先强制 source 一遍 `~/.bashrc`，再把上面那组
-> Corex 变量显式补齐，两台一致）。
+> 上面这组变量两台机器的 `~/.bashrc` 里都有，但**内容不一样**，
+> 明细见 [1.8 环境变量](#18-环境变量两台机器的-bashrc)。
+>
+> 走 `udtca-config` 时不用操心：编排器会把两台机器的环境对齐
+> （`case_common.SETUP_CMDS` 里先强制 source 一遍 `~/.bashrc`，再把 u62 有、
+> u210 缺的那几个 Corex 变量显式补齐）。
 
 ### 2.4 限速
 
