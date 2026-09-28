@@ -1,6 +1,9 @@
 [submodule "bitscom"]
 	path = bitscom
-	url = https://github.com/Aerithy/bitscom.git
+	url = git@github.com:Squirrel7ang/bitscom.git
 [submodule "polar-sgd"]
 	path = polar-sgd
-	url = https://github.com/Aerithy/polar-sgd.git
+	url = git@github.com:Squirrel7ang/polar-sgd.git
+[submodule "udtca-config"]
+	path = udtca-config
+	url = git@github.com:Squirrel7ang/udtca-config.git

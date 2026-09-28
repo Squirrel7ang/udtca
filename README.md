@@ -15,6 +15,7 @@ benchmarks, and plotting/analysis artifacts.
 | [`bitscom/`](bitscom/) | Git submodule for the low-bit distributed communication library. It provides a PyTorch-facing API, C++/CUDA backend code, quantization utilities, tests, benchmarks, and implementation notes. See [bitscom README](bitscom/README.md) and [bitscom Chinese README](bitscom/README_cn.md). |
 | [`polar-sgd/`](polar-sgd/) | Git submodule for Polar SGD, including training scripts, source package code, tests, and figures/docs for cross-data-center distributed training with communication/computation overlap. See [polar-sgd README](polar-sgd/README.md) and [polar-sgd Chinese README](polar-sgd/README_cn.md). |
 | [`experiments/`](experiments/) | Local experiment workspace that integrates the submodules into runnable benchmarks and training jobs for quantization, collective communication, Qwen14B, YOLOv8, and result plotting. |
+| [`udtca-config/`](udtca-config/) | Git submodule with the experiment orchestrator: it generates per-case launch scripts from `test.json`, dispatches them to both nodes, applies `tc` rate limits, and collects logs into `runtime_log/`. See [udtca-config README](udtca-config/README.md) and the [Chinese top-level README](README_cn.md) for the full walkthrough. |
 | [`debug_logs/`](debug_logs/) | Local debug/timing logs produced by experiment runs. This is runtime output rather than core source code. |
 | [`tb_scalars/`](tb_scalars/) | TensorBoard scalar exports and derived comparison artifacts used for plotting or post-run analysis. |
 | [`trace/`](trace/) | Trace outputs from training or communication profiling runs. |
@@ -72,15 +73,19 @@ benchmarks, and plotting/analysis artifacts.
 
 Submodules are declared in [`.gitmodules`](.gitmodules):
 
-| Submodule | Path | Upstream | README links |
+| Submodule | Path | Upstream | Branch |
 | --- | --- | --- | --- |
-| `bitscom` | [`bitscom/`](bitscom/) | <https://github.com/Aerithy/bitscom.git> | [local English](bitscom/README.md), [local Chinese](bitscom/README_cn.md), [upstream English](https://github.com/Aerithy/bitscom/blob/main/README.md), [upstream Chinese](https://github.com/Aerithy/bitscom/blob/main/README_cn.md) |
-| `polar-sgd` | [`polar-sgd/`](polar-sgd/) | <https://github.com/Aerithy/polar-sgd.git> | [local English](polar-sgd/README.md), [local Chinese](polar-sgd/README_cn.md), [upstream English](https://github.com/Aerithy/polar-sgd/blob/main/README.md), [upstream Chinese](https://github.com/Aerithy/polar-sgd/blob/main/README_cn.md) |
+| `bitscom` | [`bitscom/`](bitscom/) | <https://github.com/Squirrel7ang/bitscom.git> | `main` |
+| `polar-sgd` | [`polar-sgd/`](polar-sgd/) | <https://github.com/Squirrel7ang/polar-sgd.git> | `main` |
+| `udtca-config` | [`udtca-config/`](udtca-config/) | <https://github.com/Squirrel7ang/udtca-config.git> | `master` |
+
+Local READMEs: [bitscom English](bitscom/README.md) / [Chinese](bitscom/README_cn.md),
+[polar-sgd English](polar-sgd/README.md) / [Chinese](polar-sgd/README_cn.md).
 
 Clone with submodules:
 
 ```bash
-git clone --recursive <repo-url>
+git clone --recursive git@github.com:Squirrel7ang/udtca.git
 ```
 
 If the repository was cloned without `--recursive`:
@@ -94,10 +99,12 @@ git submodule update --init --recursive
 Repository and subdirectory README files:
 
 - [Top-level README](README.md)
+- [Top-level Chinese README](README_cn.md) — setup and run instructions
 - [bitscom README](bitscom/README.md)
 - [bitscom Chinese README](bitscom/README_cn.md)
 - [polar-sgd README](polar-sgd/README.md)
 - [polar-sgd Chinese README](polar-sgd/README_cn.md)
+- [udtca-config README](udtca-config/README.md)
 - [quantization experiments README](experiments/quantization/README.md)
 - [quantization experiments Chinese README](experiments/quantization/README_cn.md)
 - [Qwen14B experiments README](experiments/qwen14b/README.md)
