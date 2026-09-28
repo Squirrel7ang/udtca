@@ -1,0 +1,40 @@
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+cache/
+
+# ---- 运行日志 / 输出 ----
+log/
+script_log/
+runtime_log/
+debug_logs/
+*.log
+experiments/yolov8/outputs/
+experiments/qwen14b/outputs/
+
+# ---- 数据集 ----
+fineweb_data/
+*.parquet
+
+# ---- 模型权重 / 大文件 ----
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
