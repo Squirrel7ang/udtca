@@ -372,6 +372,32 @@ tc qdisc del dev ens1f0 root
 > - 跑完记得 `tc qdisc del`，否则会给共享机器留一条限速规则。
 > - 不限速时两机之间就是交换机给的理论带宽 **12.5 Gb/s**。
 
+### 2.5 QwenVL8B：同一套流程的多模态版本
+
+`experiments/qwenvl8b/` 是照着 Qwen14B 搭的 Qwen3-VL 版本，
+模型是 `Qwen/Qwen3-VL-8B-Instruct`，拓扑 **PP=8 / TP=1 / DP=4**：
+
+```bash
+# 创新路径 POLAR + bitscom（node 0 在 u62 上跑）
+bash experiments/qwenvl8b/0_train_qwenvl8b_polar_dp_pp.sh
+ssh u210 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_polar_dp_pp.sh"
+
+# 稠密 DP baseline
+bash experiments/qwenvl8b/0_train_qwenvl8b_baseline_ddp_1f1b.sh
+ssh u210 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_baseline_ddp_1f1b.sh"
+```
+
+和 Qwen14B 的三点不同，细节都写在
+[QwenVL8B README](experiments/qwenvl8b/README.md) 里：
+
+1. **视觉塔挂在 PP 的第一个 stage**，stage 0 多做一次视觉前向 + DeepStack；
+2. **数据是先搓的随机张量**，只保留了 `get_dataloader()` 接口；
+3. **只从网上取 config，本地随机初始化权重**，`--init-from-pretrained` 是预留接口。
+
+这套脚本依赖 `polar-sgd` 里几个向后兼容的 wrapper 改动（多了 `pixel_values`
+等额外输入的透传、LayerNorm/Conv 初始化等）。**双机上跑之前要确认 u210 上的
+`polar-sgd` 是同一版**，否则会报错或者静默算错。
+
 ---
 
 ## 3. 用 `udtca-config` 编排（推荐）
@@ -396,18 +422,33 @@ ssh u210 '/usr/local/corex-4.4.0/bin/ixsmi --query-gpu=index,memory.used --forma
 
 ### 3.2 目录里有什么
 
+按实验分目录，`qwen14b/` 和 `qwenvl8b/` 结构一一对应：
+
+```
+udtca-config/
+├── common/     case_common.py（公共库）+ orchestrator.py（通用编排流程）
+├── qwen14b/    default.json / test.json / generate_and_run.py / generate_and_run_baseline.py
+├── qwenvl8b/   同上四个文件
+└── utils/      watch_bandwidth.py / collect_case_logs.py / trace_processor.py
+                download_fineweb.py / build_comm_opt_data.py
+```
+
 | 文件 | 作用 |
 |---|---|
-| `generate_and_run.py` | **主编排入口**。按 `test.json` 逐条跑，按每条的 `baseline` 标记分派 polar / baseline |
-| `generate_and_run_baseline.py` | 只跑 baseline 的入口，同时对外提供 `run_baseline_case()` 供上面那个 import |
-| `case_common.py` | 核心库：两节点命令封装、`SETUP_CMDS`、case 编号与 `case.json` 读写、GPU 检查、日志回收 |
-| `collect_case_logs.py` | 把训练侧写的深层 `./log/...` 拍平成 `tb_scalars` / `tb_trace` / `step_csv` |
-| `trace_processor.py` | 从 `runtime_log/` 提取每个 case 的平均步时和吞吐，做 POLAR vs baseline 对比 |
-| `watch_bandwidth.py` | 实时监测两机之间的网卡带宽（只读，不干扰训练） |
-| `download_fineweb.py` | 按需下载 fineweb parquet 数据集到指定目录 |
-| `build_comm_opt_data.py` | 把实验数据整理成交付目录树并打包成 zip |
-| `default.json` | 默认超参，没在 `test.json` 里写的字段都从这里继承 |
-| `test.json` | 实验矩阵（要跑哪些 case） |
+| `<exp>/generate_and_run.py` | **主编排入口**。按 `test.json` 逐条跑，按每条的 `baseline` 标记分派 polar / baseline |
+| `<exp>/generate_and_run_baseline.py` | 只跑 baseline 的入口，共用同一套 case 编号 |
+| `<exp>/default.json` / `test.json` | 默认超参 / 实验矩阵 |
+| `common/case_common.py` | 核心库：两节点命令封装、`SETUP_CMDS`、case 编号与 `case.json` 读写、GPU 检查、日志回收 |
+| `common/orchestrator.py` | 通用编排流程（生成脚本/下发/限速/起训/收日志）+ 训练脚本模板 |
+| `utils/collect_case_logs.py` | 把训练侧写的深层 `./log/...` 拍平成 `tb_scalars` / `tb_trace` / `step_csv` |
+| `utils/trace_processor.py` | 从 `runtime_log/` 提取每个 case 的平均步时和吞吐，做 POLAR vs baseline 对比 |
+| `utils/watch_bandwidth.py` | 实时监测两机之间的网卡带宽（只读，不干扰训练） |
+| `utils/download_fineweb.py` | 按需下载 fineweb parquet 数据集到指定目录 |
+| `utils/build_comm_opt_data.py` | 把实验数据整理成交付目录树并打包成 zip |
+
+**QwenVL8B** 走同一套流程，把上面的 `qwen14b` 换成 `qwenvl8b` 即可。它的并行拓扑是
+PP=8 / TP=1 / DP=4，数据是随机搓的，详情见
+[QwenVL8B 实验 README](experiments/qwenvl8b/README.md)。
 
 ### 3.3 配置格式
 
@@ -460,7 +501,7 @@ ssh u210 '/usr/local/corex-4.4.0/bin/ixsmi --query-gpu=index,memory.used --forma
 
 ```bash
 cd /data1/tangruijing/udtca
-python udtca-config/generate_and_run.py
+python udtca-config/qwen14b/generate_and_run.py
 ```
 
 跑之前会先检查两个节点的 GPU 占用，**被占用就直接报错退出，不会启动任何训练**。
@@ -470,7 +511,7 @@ python udtca-config/generate_and_run.py
 正式跑之前建议先验证环境能跑通。用 `--runtime-log off`：
 
 ```bash
-python udtca-config/generate_and_run.py --runtime-log off
+python udtca-config/qwen14b/generate_and_run.py --runtime-log off
 ```
 
 这个开关关掉时：不占 case 编号、不建 `runtime_log/000N/`、不写 `case.json`、
@@ -480,14 +521,14 @@ python udtca-config/generate_and_run.py --runtime-log off
 也可以用环境变量代替命令行开关（优先级：命令行 > 环境变量 > 默认 on）：
 
 ```bash
-UDTCA_RUNTIME_LOG=0 python udtca-config/generate_and_run.py
+UDTCA_RUNTIME_LOG=0 python udtca-config/qwen14b/generate_and_run.py
 ```
 
 ### 3.6 只跑 baseline
 
 ```bash
-python udtca-config/generate_and_run_baseline.py            # 只跑 test.json 里 baseline=True 的
-python udtca-config/generate_and_run_baseline.py --runtime-log off
+python udtca-config/qwen14b/generate_and_run_baseline.py            # 只跑 test.json 里 baseline=True 的
+python udtca-config/qwen14b/generate_and_run_baseline.py --runtime-log off
 ```
 
 两个入口共用同一套 case 编号和同一个 `runtime_log/case.json`。
@@ -554,19 +595,19 @@ bash runtime_log/0001/launch.sh 1
 
 ```bash
 # 实时看两机带宽（每 1 秒一行，Ctrl-C 退出）
-python udtca-config/watch_bandwidth.py
+python udtca-config/utils/watch_bandwidth.py
 
 # 汇总每个 case 的平均步时 / 吞吐，并做 POLAR vs baseline 同网速对比
-python udtca-config/trace_processor.py
-python udtca-config/trace_processor.py --case 0001 0002 --csv out.csv
+python udtca-config/utils/trace_processor.py
+python udtca-config/utils/trace_processor.py --case 0001 0002 --csv out.csv
 
 # 下载 fineweb 数据集（先 --dry-run 看计划）
-python udtca-config/download_fineweb.py --dry-run
-python udtca-config/download_fineweb.py --target-gb 20 --dest /data1/tangruijing/fineweb_data
+python udtca-config/utils/download_fineweb.py --dry-run
+python udtca-config/utils/download_fineweb.py --target-gb 20 --dest /data1/tangruijing/fineweb_data
 
 # 把实验数据整理成交付目录树并打包 zip
-python udtca-config/build_comm_opt_data.py --dry-run
-python udtca-config/build_comm_opt_data.py --dest /data1/tangruijing/comm-opt-data
+python udtca-config/utils/build_comm_opt_data.py --dry-run
+python udtca-config/utils/build_comm_opt_data.py --dest /data1/tangruijing/comm-opt-data
 ```
 
 > `build_comm_opt_data.py` 遵守两条硬规则：**只做复制 / 新建，绝不移动、
@@ -598,4 +639,5 @@ python udtca-config/build_comm_opt_data.py --dest /data1/tangruijing/comm-opt-da
 - [polar-sgd README](polar-sgd/README.md) / [中文](polar-sgd/README_cn.md)
 - [udtca-config README](udtca-config/README.md)
 - [Qwen14B 实验 README](experiments/qwen14b/README.md)
+- [QwenVL8B 实验 README](experiments/qwenvl8b/README.md)
 - [量化实验 README](experiments/quantization/README.md) / [中文](experiments/quantization/README_cn.md)

@@ -21,6 +21,7 @@ debug_logs/
 *.log
 experiments/yolov8/outputs/
 experiments/qwen14b/outputs/
+experiments/qwenvl8b/outputs/
 
 # ---- 数据集 ----
 fineweb_data/
