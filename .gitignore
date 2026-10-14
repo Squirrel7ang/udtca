@@ -17,6 +17,7 @@ cache/
 log/
 script_log/
 runtime_log/
+run_log/
 debug_logs/
 *.log
 experiments/yolov8/outputs/
