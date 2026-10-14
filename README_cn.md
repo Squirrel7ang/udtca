@@ -427,7 +427,7 @@ ssh u210 '/usr/local/corex-4.4.0/bin/ixsmi --query-gpu=index,memory.used --forma
 ```
 udtca-config/
 ├── common/     case_common.py（公共库）+ orchestrator.py（通用编排流程）
-├── qwen14b/    default.json / test.json / generate_and_run.py / generate_and_run_baseline.py
+├── qwen14b/    default.json / test.json / generate_and_run.py（主入口）/ _run_baseline.py（内部脚本）
 ├── qwenvl8b/   同上四个文件
 └── utils/      watch_bandwidth.py / collect_case_logs.py / trace_processor.py
                 download_fineweb.py / build_comm_opt_data.py
@@ -435,8 +435,8 @@ udtca-config/
 
 | 文件 | 作用 |
 |---|---|
-| `<exp>/generate_and_run.py` | **主编排入口**。按 `test.json` 逐条跑，按每条的 `baseline` 标记分派 polar / baseline |
-| `<exp>/generate_and_run_baseline.py` | 只跑 baseline 的入口，共用同一套 case 编号 |
+| `<exp>/generate_and_run.py` | **唯一对外入口**。按 `test.json` 逐条跑，按每条的 `baseline` 标记分派 polar / baseline |
+| `<exp>/_run_baseline.py` | 内部脚本（名字带 `_` 前缀，一般不直接调用）：只跑 baseline，共用同一套 case 编号 |
 | `<exp>/default.json` / `test.json` | 默认超参 / 实验矩阵 |
 | `common/case_common.py` | 核心库：两节点命令封装、`SETUP_CMDS`、case 编号与 `case.json` 读写、GPU 检查、日志回收 |
 | `common/orchestrator.py` | 通用编排流程（生成脚本/下发/限速/起训/收日志）+ 训练脚本模板 |
@@ -526,9 +526,18 @@ UDTCA_RUNTIME_LOG=0 python udtca-config/qwen14b/generate_and_run.py
 
 ### 3.6 只跑 baseline
 
+只跑 baseline 就是 `generate_and_run.py` 的一个子集，一般直接用它加 `--only` 指定 index 即可：
+
 ```bash
-python udtca-config/qwen14b/generate_and_run_baseline.py            # 只跑 test.json 里 baseline=True 的
-python udtca-config/qwen14b/generate_and_run_baseline.py --runtime-log off
+python udtca-config/qwen14b/generate_and_run.py --only 2,4
+```
+
+确有需要、且只想按 `baseline=True` 过滤时，才用内部脚本 `_run_baseline.py`
+（文件名带 `_` 前缀，表示不对外，一般不用直接调用）：
+
+```bash
+python udtca-config/qwen14b/_run_baseline.py            # 只跑 test.json 里 baseline=True 的
+python udtca-config/qwen14b/_run_baseline.py --runtime-log off
 ```
 
 两个入口共用同一套 case 编号和同一个 `runtime_log/case.json`。
