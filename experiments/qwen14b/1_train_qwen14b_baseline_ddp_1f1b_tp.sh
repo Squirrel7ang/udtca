@@ -30,7 +30,7 @@ torchrun \
   --tp-size 2 \
   --micro-batches 32 \
   --comm-timing 0 \
-  --max-steps 200 \
+  --max-steps "${MAX_STEPS:-200}" \
   --per-device-batch-size 32 \
   --seq-len 256 \
   --lr 2e-4 \
