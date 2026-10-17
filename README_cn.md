@@ -18,10 +18,10 @@
 
 | 项 | 值 |
 |---|---|
-| 调度节点（MASTER） | **u62**，`10.31.10.62` |
-| 训练节点 | **u210**，`10.31.10.210` |
+| 调度节点（MASTER） | **u13**，`10.31.10.13` |
+| 训练节点 | **u177**，`10.31.10.177` |
 | 仓库路径 | `/data1/tangruijing/udtca`，**两个节点上必须一致** |
-| conda 环境 | `trj-test`（两节点都要有） |
+| conda 环境 | `udtca`（两节点都要有） |
 | GPU | 单机 16 卡，两机共 32 卡 |
 | 互联网卡 | `ens1f0`，接 100 Gb 八口交换机，**每台机器理论带宽 12.5 Gb/s** |
 | 模型 | `Qwen/Qwen2.5-14B-Instruct` |
@@ -30,7 +30,7 @@
 | 训练入口 | `experiments/qwen14b/run_qwen14b_polar_dp_pp_tp.py` |
 
 rank 分配：`rank = dp * (pp * tp) + pp_index * tp_size + tp_index`，
-DP 维在节点间切分，所以 PP 的前几级在 u62、后几级在 u210。
+DP 维在节点间切分，所以 PP 的前几级在 u13、后几级在 u177。
 
 ---
 
@@ -49,7 +49,7 @@ ls /usr/local/corex-4.4.0/bin/clang++    # Corex 的 CUDA 编译器（编译扩�
 ixsmi --query-gpu=index,memory.used --format=csv,noheader
 ```
 
-> u62 上 `ixsmi` 在 PATH 里；**u210 上不在**，要用绝对路径
+> u13 上 `ixsmi` 在 PATH 里；**u177 上不在**，要用绝对路径
 > `/usr/local/corex-4.4.0/bin/ixsmi`。两台上都没有 `nvidia-smi`。
 
 ### 1.2 拉代码
@@ -105,8 +105,8 @@ git submodule status
 ### 1.3 建 conda 环境
 
 ```bash
-conda create -n trj-test python=3.10 -y
-conda activate trj-test
+conda create -n udtca python=3.10 -y
+conda activate udtca
 ```
 
 Python 用 **3.10**（当前验证过的版本）。天数的 PyTorch 要用
@@ -134,13 +134,13 @@ CUDA_HOME=/usr/local/corex-4.4.0 \
 BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++ \
 NCCL_LIB_DIR=/usr/local/corex-4.4.0/lib64 \
 NCCL_INCLUDE_DIR=/usr/local/corex-4.4.0/include \
-/root/miniconda3/envs/trj-test/bin/python -m pip install -e . --no-build-isolation
+/root/miniconda3/envs/udtca/bin/python -m pip install -e . --no-build-isolation
 ```
 
 > - `--no-build-isolation` 是必须的，不然 pip 会另起一个干净的构建环境，
 >   里面没有 Corex 的 torch，编译直接失败。
 > - `BITSCOM_CUDA_COMPILER` 是最关键的一个：**不指定它就会去调 `nvcc`**。
-> - `NCCL_LIB_DIR` / `NCCL_INCLUDE_DIR` 在 u210 上尤其要加，
+> - `NCCL_LIB_DIR` / `NCCL_INCLUDE_DIR` 在 u177 上尤其要加，
 >   不然链接阶段 conda 的 `compiler_compat/ld` 找不到 `-lnccl`。
 > - 编译过程会在仓库根生成 `compile_commands.json`（给 clangd 用），
 >   以及 `build/` 中间目录 —— 这些都已经在 `.gitignore` 里，不用管。
@@ -149,7 +149,7 @@ NCCL_INCLUDE_DIR=/usr/local/corex-4.4.0/include \
 
 ```bash
 python -c "import bitscom; print(bitscom.__file__)"
-ls /root/miniconda3/envs/trj-test/lib/python3.10/site-packages/__editable__.bitscom-0.1.0.pth
+ls /root/miniconda3/envs/udtca/lib/python3.10/site-packages/__editable__.bitscom-0.1.0.pth
 ```
 
 ### 1.5 装 polar-sgd
@@ -158,7 +158,7 @@ ls /root/miniconda3/envs/trj-test/lib/python3.10/site-packages/__editable__.bits
 
 ```bash
 cd /data1/tangruijing/udtca/polar-sgd
-/root/miniconda3/envs/trj-test/bin/python -m pip install -e . --no-build-isolation
+/root/miniconda3/envs/udtca/bin/python -m pip install -e . --no-build-isolation
 ```
 
 > polar-sgd 现在在 **`main` 分支**上（原来的 `refactor` 分支已经合并进
@@ -171,7 +171,7 @@ cd /data1/tangruijing/udtca/polar-sgd
 
 ```bash
 python -c "import psgd; print(psgd.__file__)"
-ls /root/miniconda3/envs/trj-test/lib/python3.10/site-packages/__editable__.psgd-0.1.0.pth
+ls /root/miniconda3/envs/udtca/lib/python3.10/site-packages/__editable__.psgd-0.1.0.pth
 ```
 
 ### 1.6 装 flash-attn（Qwen14B 需要）
@@ -183,8 +183,8 @@ Qwen14B 的入口脚本里 `--use-flash-attn` 是 **默认为真且无法关闭*
 天数用的是预编译好的 Corex 轮子（cp310），六个一起装：
 
 ```bash
-cd /root/apps/py3.10/flash_attn          # u62 上的位置
-/root/miniconda3/envs/trj-test/bin/python -m pip install \
+cd /root/apps/py3.10/flash_attn          # u13 上的位置
+/root/miniconda3/envs/udtca/bin/python -m pip install \
     flash_attn-2.6.3+corex.4.4.0-cp310-cp310-linux_x86_64.whl \
     fused_dense_lib-0.1+corex.4.4.0-cp310-cp310-linux_x86_64.whl \
     fused_softmax_lib-0.1+corex.4.4.0-cp310-cp310-linux_x86_64.whl \
@@ -193,7 +193,7 @@ cd /root/apps/py3.10/flash_attn          # u62 上的位置
     dropout_layer_norm-0.1+corex.4.4.0-cp310-cp310-linux_x86_64.whl
 ```
 
-> **u210 上没有 `/root/apps` 这个目录**。把整个 `flash_attn/` 目录
+> **u177 上没有 `/root/apps` 这个目录**。把整个 `flash_attn/` 目录
 > `scp` 过去（比如放到 `/root/flash_wheels/`）再装即可，轮子是通用的。
 
 自检：
@@ -207,7 +207,7 @@ python -c "import flash_attn; print(flash_attn.__version__)"   # 2.6.3
 装完在**两台**上分别跑一遍：
 
 ```bash
-P=/root/miniconda3/envs/trj-test/bin/python
+P=/root/miniconda3/envs/udtca/bin/python
 $P -c "import torch, bitscom, psgd, flash_attn, transformers, datasets; \
 print(torch.__version__); print(bitscom.__file__); print(psgd.__file__)"
 ```
@@ -277,40 +277,40 @@ source ~/.bashrc
 想先不借助编排器、直接手动起一次，按这一节做。日常跑实验用第 3 节的
 `udtca-config` 更省事。
 
-### 2.1 关键：u62 必须是 MASTER
+### 2.1 关键：u13 必须是 MASTER
 
 `torchrun` 的 `node_rank=0` 会 **bind** `MASTER_ADDR:MASTER_PORT` 作为
 rendezvous 服务端，`node_rank=1` 作为客户端连过去。
 
-**如果 `MASTER_ADDR` 写的是 u210 的地址，u62 会绑不上（`EADDRNOTAVAIL`），
+**如果 `MASTER_ADDR` 写的是 u177 的地址，u13 会绑不上（`EADDRNOTAVAIL`），
 然后两边永远干等，一个 worker 都起不来。** 所以：
 
-| | u62 | u210 |
+| | u13 | u177 |
 |---|---|---|
 | 跑哪个脚本 | `0_train_*`（`--node_rank=0`） | `1_train_*`（`--node_rank=1`） |
 | 角色 | **MASTER_NODE** | 客户端 |
-| `MASTER_ADDR` | `10.31.10.62` | `10.31.10.62` |
+| `MASTER_ADDR` | `10.31.10.13` | `10.31.10.13` |
 | `MASTER_PORT` | polar 用 `29500`，baseline 用 `29501` | 同左 |
 
 > ⚠️ **`experiments/qwen14b/` 下那 4 个脚本的 `MASTER_ADDR` 默认值是
-> `10.31.10.210`（u210），不是 u62。** 手工跑的时候必须自己覆盖：
+> `10.31.10.177`（u177），不是 u13。** 手工跑的时候必须自己覆盖：
 >
 > ```bash
-> MASTER_ADDR=10.31.10.62 bash experiments/qwen14b/0_train_qwen14b_polar_dp_pp_tp.sh
+> MASTER_ADDR=10.31.10.13 bash experiments/qwen14b/0_train_qwen14b_polar_dp_pp_tp.sh
 > ```
 >
 > 走 `udtca-config`（第 3 节）时不需要管 —— 编排器会在起训前
-> `export MASTER_ADDR=10.31.10.62`，脚本里是 `${MASTER_ADDR:-...}` 的写法，
+> `export MASTER_ADDR=10.31.10.13`，脚本里是 `${MASTER_ADDR:-...}` 的写法，
 > 环境变量优先。
 
 ### 2.2 两个节点的启动脚本
 
 | 脚本 | 节点 | 跑什么 |
 |---|---|---|
-| `0_train_qwen14b_polar_dp_pp_tp.sh` | u62 | POLAR + bitscom，node_rank=0 |
-| `1_train_qwen14b_polar_dp_pp_tp.sh` | u210 | POLAR + bitscom，node_rank=1 |
-| `0_train_qwen14b_baseline_ddp_1f1b_tp.sh` | u62 | 纯 DP baseline，node_rank=0 |
-| `1_train_qwen14b_baseline_ddp_1f1b_tp.sh` | u210 | 纯 DP baseline，node_rank=1 |
+| `0_train_qwen14b_polar_dp_pp_tp.sh` | u13 | POLAR + bitscom，node_rank=0 |
+| `1_train_qwen14b_polar_dp_pp_tp.sh` | u177 | POLAR + bitscom，node_rank=1 |
+| `0_train_qwen14b_baseline_ddp_1f1b_tp.sh` | u13 | 纯 DP baseline，node_rank=0 |
+| `1_train_qwen14b_baseline_ddp_1f1b_tp.sh` | u177 | 纯 DP baseline，node_rank=1 |
 
 两者都是 `torchrun --nnodes=2 --nproc_per_node=16`，区别只在
 **走不走 bitscom 的 `lowbit` 后端**。
@@ -322,29 +322,29 @@ rendezvous 服务端，`node_rank=1` 作为客户端连过去。
 
 ### 2.3 起训
 
-u62 上开一个终端：
+u13 上开一个终端：
 
 ```bash
 cd /data1/tangruijing/udtca
-conda activate trj-test
-MASTER_ADDR=10.31.10.62 bash experiments/qwen14b/0_train_qwen14b_polar_dp_pp_tp.sh
+conda activate udtca
+MASTER_ADDR=10.31.10.13 bash experiments/qwen14b/0_train_qwen14b_polar_dp_pp_tp.sh
 ```
 
-u210 上开另一个终端：
+u177 上开另一个终端：
 
 ```bash
-ssh u210
+ssh 10.31.10.177
 cd /data1/tangruijing/udtca
-conda activate trj-test
-MASTER_ADDR=10.31.10.62 bash experiments/qwen14b/1_train_qwen14b_polar_dp_pp_tp.sh
+conda activate udtca
+MASTER_ADDR=10.31.10.13 bash experiments/qwen14b/1_train_qwen14b_polar_dp_pp_tp.sh
 ```
 
 > 这 4 个脚本**自己不 export Corex 的环境变量**（`COREX_PATH` / `CPATH` /
 > `LIBRARY_PATH` / `TRITON_CUDA_SYSROOT` / `BITSCOM_CUDA_COMPILER` 等），
 > 它们都依赖你当前的 shell 已经把这些设好。所以手工跑之前请确认：
 >
-> - 在 u62 上，你的交互 shell 已经 source 过 `~/.bashrc`（登录时自动）；
-> - 在 u210 上，`ssh u210` 是**非交互 shell**，默认什么都不 source，
+> - 在 u13 上，你的交互 shell 已经 source 过 `~/.bashrc`（登录时自动）；
+> - 在 u177 上，`ssh 10.31.10.177` 是**非交互 shell**，默认什么都不 source，
 >   需要在跑之前 `. ~/.bashrc`，或者自己把那一组 Corex 变量 export 一遍。
 >
 > 这些变量就是 [1.8 节](#18-环境变量必设)要求写进 `~/.bashrc` 的那一组。
@@ -378,13 +378,13 @@ tc qdisc del dev ens1f0 root
 模型是 `Qwen/Qwen3-VL-8B-Instruct`，拓扑 **PP=8 / TP=1 / DP=4**：
 
 ```bash
-# 创新路径 POLAR + bitscom（node 0 在 u62 上跑）
+# 创新路径 POLAR + bitscom（node 0 在 u13 上跑）
 bash experiments/qwenvl8b/0_train_qwenvl8b_polar_dp_pp.sh
-ssh u210 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_polar_dp_pp.sh"
+ssh 10.31.10.177 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_polar_dp_pp.sh"
 
 # 稠密 DP baseline
 bash experiments/qwenvl8b/0_train_qwenvl8b_baseline_ddp_1f1b.sh
-ssh u210 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_baseline_ddp_1f1b.sh"
+ssh 10.31.10.177 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_baseline_ddp_1f1b.sh"
 ```
 
 和 Qwen14B 的三点不同，细节都写在
@@ -395,7 +395,7 @@ ssh u210 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_ba
 3. **只从网上取 config，本地随机初始化权重**，`--init-from-pretrained` 是预留接口。
 
 这套脚本依赖 `polar-sgd` 里几个向后兼容的 wrapper 改动（多了 `pixel_values`
-等额外输入的透传、LayerNorm/Conv 初始化等）。**双机上跑之前要确认 u210 上的
+等额外输入的透传、LayerNorm/Conv 初始化等）。**双机上跑之前要确认 u177 上的
 `polar-sgd` 是同一版**，否则会报错或者静默算错。
 
 ---
@@ -403,19 +403,19 @@ ssh u210 "bash /data1/tangruijing/udtca/experiments/qwenvl8b/1_train_qwenvl8b_ba
 ## 3. 用 `udtca-config` 编排（推荐）
 
 `udtca-config/` 不是训练代码，是**调度器**：读配置矩阵 → 生成两节点的启动脚本 →
-下发到 u210 → 两边限速 → 起训 → 回收日志 → 归档到 `runtime_log/<编号>/`。
+下发到 u177 → 两边限速 → 起训 → 回收日志 → 归档到 `runtime_log/<编号>/`。
 
-**只需要在 u62 上跑一条命令**，它会同时操控 u62（node 0）和 u210（node 1）。
+**只需要在 u13 上跑一条命令**，它会同时操控 u13（node 0）和 u177（node 1）。
 
 ### 3.1 前置检查
 
 ```bash
 # 1) 免密 ssh 通
-ssh u210 hostname
+ssh 10.31.10.177 hostname
 
 # 2) 两节点的 GPU 都空闲（脚本自己也会查，占用会直接中止）
 ixsmi --query-gpu=index,memory.used --format=csv,noheader
-ssh u210 '/usr/local/corex-4.4.0/bin/ixsmi --query-gpu=index,memory.used --format=csv,noheader'
+ssh 10.31.10.177 '/usr/local/corex-4.4.0/bin/ixsmi --query-gpu=index,memory.used --format=csv,noheader'
 
 # 3) 两节点都装好了 bitscom / polar-sgd（见第 1 节）
 ```
@@ -497,7 +497,7 @@ PP=8 / TP=1 / DP=4，数据是随机搓的，详情见
 
 ### 3.4 跑起来
 
-在 **u62** 上：
+在 **u13** 上：
 
 ```bash
 cd /data1/tangruijing/udtca
@@ -550,8 +550,8 @@ python udtca-config/qwen14b/_run_baseline.py --runtime-log off
 ├── environment.json       机器与网络环境说明（交数据时用）
 ├── 0001/
 │   ├── launch.sh                       完整自包含的复现脚本
-│   ├── 0_train_qwen14b_exp1.sh         node0(u62) 实际跑的
-│   ├── 1_train_qwen14b_exp1.sh         node1(u210) 实际跑的（从远程拉回）
+│   ├── 0_train_qwen14b_exp1.sh         node0(u13) 实际跑的
+│   ├── 1_train_qwen14b_exp1.sh         node1(u177) 实际跑的（从远程拉回）
 │   ├── traffic_control_exp1.sh         网络限速脚本
 │   ├── train_node0.log                 node0 的 torchrun 全部输出
 │   ├── train_node1.log                 node1 的 torchrun 全部输出（从远程拉回）
@@ -566,9 +566,9 @@ python udtca-config/qwen14b/_run_baseline.py --runtime-log off
 **不是** `test.json` 里的 `index`。
 
 **训练日志**：两个节点的 torchrun 输出**各自重定向**到 case 目录下的
-`train_node0.log` / `train_node1.log`，不刷屏。u210 的那份先写在 u210 上，
-跑完由 rsync 拉回同一个 case 目录。**终端上只看到 u62 的输出**
-（PP 最后一级在 u62 上有 rank 14/15，loss 照样看得到）。
+`train_node0.log` / `train_node1.log`，不刷屏。u177 的那份先写在 u177 上，
+跑完由 rsync 拉回同一个 case 目录。**终端上只看到 u13 的输出**
+（PP 最后一级在 u13 上有 rank 14/15，loss 照样看得到）。
 
 想看实时输出就另开一个终端：
 
@@ -581,9 +581,9 @@ tail -f runtime_log/0001/train_node0.log
 每个 case 目录里的 `launch.sh` 是**自包含**的：
 
 ```bash
-# node 0 (u62)
+# node 0 (u13)
 bash runtime_log/0001/launch.sh 0
-# node 1 (u210)
+# node 1 (u177)
 bash runtime_log/0001/launch.sh 1
 ```
 
@@ -594,8 +594,8 @@ bash runtime_log/0001/launch.sh 1
 
 收到 SIGINT/SIGTERM 时编排器会：
 
-1. 杀掉本机训练进程，并 **ssh 过去把 u210 上的训练进程也杀掉**
-   —— 中断时 ssh 链路断了，但 u210 上的 torchrun 不会跟着死，会一直占着卡；
+1. 杀掉本机训练进程，并 **ssh 过去把 u177 上的训练进程也杀掉**
+   —— 中断时 ssh 链路断了，但 u177 上的 torchrun 不会跟着死，会一直占着卡；
 2. **撤销两台机器上的 `tc` 限速** —— 不撤会给共享机器留一条限速规则。
 
 清理用的是「解释器路径 + 训练入口脚本名」精确匹配，**不会误杀共享机器上别人的任务**。
@@ -628,13 +628,13 @@ python udtca-config/utils/build_comm_opt_data.py --dest /data1/tangruijing/comm-
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
-| 两边都不起 worker，一直干等 | `MASTER_ADDR` 指向了 u210，u62 的 `node_rank=0` 绑不上 | `MASTER_ADDR` 必须是 `10.31.10.62`（u62 是 MASTER） |
+| 两边都不起 worker，一直干等 | `MASTER_ADDR` 指向了 u177，u13 的 `node_rank=0` 绑不上 | `MASTER_ADDR` 必须是 `10.31.10.13`（u13 是 MASTER） |
 | 远程命令里的变量全是空串 | `ssh host '/bin/bash -c "...$VAR..."'` 两层引号让远程登录 shell 先展开了 | 整条脚本 base64 后送过去（`case_common.ssh_execute` 已这么做） |
 | `bash: command not found` / 找不到 `bash` | `export PATH='/root/miniconda3/bin:$PATH'` 用了单引号，`$PATH` 没展开，PATH 变成字面量 | 必须用**双引号** |
 | `launch.sh` 跑到 `. ~/.bashrc` 就静默退出 | `.bashrc` 里引用了未定义变量（`debian_chroot`），`set -u` 下非交互 shell 直接退出，`set +e` 拦不住 | source 前后把 `-e` `-u` 关掉再恢复（已写进 `SETUP_CMDS`） |
 | `ImportError: FlashAttention2 has been toggled on` | `--use-flash-attn` 是 `store_true, default=True`，关不掉，而 flash_attn 没装 | 按 1.6 节装 Corex 版 flash-attn |
 | bitscom 编译失败，找不到 `nvcc` | 没指定 `BITSCOM_CUDA_COMPILER` | 显式设成 `$COREX_PATH/bin/clang++` |
-| u210 链接期找不到 `-lnccl` | conda 的 `compiler_compat/ld` 搜索路径里没有 Corex 的库 | 编译时加 `NCCL_LIB_DIR` / `NCCL_INCLUDE_DIR` |
+| u177 链接期找不到 `-lnccl` | conda 的 `compiler_compat/ld` 搜索路径里没有 Corex 的库 | 编译时加 `NCCL_LIB_DIR` / `NCCL_INCLUDE_DIR` |
 | 所有 case 都被当成 baseline 跑 | `"False"` 在 Python 里是 truthy | 用 `as_bool()` 解析，不要直接 `if cfg["baseline"]` |
 | `step_csv` 里每步有 2 行重复 | TP=2 时 PP 最后一级的 2 个 rank 都会写入 | 读的时候按 step 去重（`trace_processor.py` 已处理） |
 | `log/` 目录几十 GB | 早期实验留下的旧结构（`log/True/...`） | 新实验产物一律走 `runtime_log/`，互不干扰 |

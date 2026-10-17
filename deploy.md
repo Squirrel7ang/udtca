@@ -9,29 +9,43 @@
 
 | | node0 | node1 |
 |---|---|---|
-| 主机 | u62 (`10.31.10.62`) | u210 (`10.31.10.210`) |
-| ssh 别名 | 本机 | `u210` |
+| 主机 | u13 (`10.31.10.13`) | u177 (`10.31.10.177`) |
+| ssh 别名 | 本机 | `u177` |
 | 网卡 | `ens1f0` | `ens1f0` |
 | 仓库 | `/data1/tangruijing/udtca` | 同一路径 |
 
-代码只改 node0，改完同步到 u210：
+代码只改 node0，改完用 git 同步到 node1（两个节点都能连 GitHub）：
 
 ```bash
+# node0：提交并推送
+cd /data1/tangruijing/udtca && git push origin third-test
+git -C udtca-config push origin third-test
+
+# node1：拉取（含子模块）
 cd /data1/tangruijing/udtca
-rsync -a --delete experiments/qwen14b experiments/qwenvl8b u210:/data1/tangruijing/udtca/experiments/
-rsync -a --delete udtca-config u210:/data1/tangruijing/udtca/
+git pull --ff-only origin third-test && git submodule update --init --recursive
 ```
+
+临时改脚本、还不想提交时也可以用 rsync：
+
+```bash
+rsync -a experiments/qwen14b 10.31.10.177:/data1/tangruijing/udtca/experiments/
+rsync -a udtca-config/ 10.31.10.177:/data1/tangruijing/udtca/udtca-config/
+```
+
+两台机器的 IP / ssh 目标 / conda 环境名 / 网卡都不是写死的，换机器时导出环境变量即可：
+`UDTCA_NODE0_IP`、`UDTCA_NODE1_HOST`、`UDTCA_CONDA_ENV`、`UDTCA_NIC_IFACE`。
 
 ---
 
 ## 1. 环境
 
-conda 环境固定为 `trj-test`，依赖已装好（torch 2.7.1 corex 版本）。
+conda 环境固定为 `udtca`，依赖已装好（torch 2.7.1 corex 版本）。
 
-如果需要自己重新启一个 conda 环境，需要自行安装 corex 依赖库。包括 torch 等，具体参考 trj-test 里面的内容。此外，需要安装 polar-sgd 库以及编译安装 bitscom 库。对于 bitscom 库，请查看 README\_cn.md 中关于天数 GPU 的编译安装说明。大体就是设置好环境变量。这个环境变量已经放在 .bashrc 中，应该是默认设置好的。
+如果需要自己重新启一个 conda 环境，需要自行安装 corex 依赖库。包括 torch 等，具体参考 udtca 里面的内容。此外，需要安装 polar-sgd 库以及编译安装 bitscom 库。对于 bitscom 库，请查看 README\_cn.md 中关于天数 GPU 的编译安装说明。大体就是设置好环境变量。这个环境变量已经放在 .bashrc 中，应该是默认设置好的。
 
 ```bash
-conda activate trj-test
+conda activate udtca
 ```
 
 Corex 4.4.0 相关的变量（非交互 shell 不会自动带上，**每条命令前都要有**）：
@@ -46,7 +60,7 @@ export LIBRARY_PATH="$COREX_PATH/lib64:${LIBRARY_PATH:-}"
 export TRITON_CUDA_SYSROOT="$COREX_PATH"
 export BITSCOM_CUDA_COMPILER="$COREX_PATH/bin/clang++"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PATH="$COREX_PATH/bin:/root/miniconda3/envs/trj-test/bin:$PATH"
+export PATH="$COREX_PATH/bin:/root/miniconda3/envs/udtca/bin:$PATH"
 ```
 
 目前 qwen14b 是走 HF 拉 config 走镜像（非登录 shell 不读 `~/.bashrc`，必须显式导出）：
@@ -65,7 +79,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 ```bash
 ixsmi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
 pgrep -af 'run_qwen.*py|pt_elastic|torchrun'
-ssh u210 "source /tmp/vl_setup.sh; ixsmi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader"
+ssh 10.31.10.177 "source /tmp/vl_setup.sh; ixsmi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader"
 ```
 
 ---
@@ -74,7 +88,7 @@ ssh u210 "source /tmp/vl_setup.sh; ixsmi --query-gpu=index,utilization.gpu,memor
 
 上面的所有流程逻辑都被编写到 udtca-config 里面了。** 也就是说你只需要配置好 conda 环境，克隆 udtca 并初始化所有子模块，正确设置代码路径，然后运行 udtca/.../generate_and_run.py 文件就可以了跑起来了 **。
 
-编排器会自己：清 tc → 按速率配 tc → 生成两节点的启动脚本 → scp 到 u210 → 同时拉起 →
+编排器会自己：清 tc → 按速率配 tc → 生成两节点的启动脚本 → scp 到 u177 → 同时拉起 →
 回收日志到 `runtime_log/<case>/` → 复原 tc。
 
 ```bash
@@ -117,17 +131,17 @@ qwen14b 换 `qwen14b/generate_and_run.py`，用法完全一样。
 不想走编排器时，两节点各跑一条（**先起 node1，再起 node0**）：
 
 ```bash
-# 在 u210 上
-ssh u210
+# 在 u177 上
+ssh 10.31.10.177
 cd /data1/tangruijing/udtca/experiments/qwenvl8b
 bash 1_train_qwenvl8b_polar_dp_pp.sh
 
-# 在 u62 上
+# 在 u13 上
 cd /data1/tangruijing/udtca/experiments/qwenvl8b
 bash 0_train_qwenvl8b_polar_dp_pp.sh
 ```
 
-脚本里可覆盖的变量：`MASTER_ADDR`（必须指向 node0，即 `10.31.10.62`）、`MASTER_PORT`、
+脚本里可覆盖的变量：`MASTER_ADDR`（必须指向 node0，即 `10.31.10.13`）、`MASTER_PORT`、
 `NNODES`、`NPROC_PER_NODE`、`NCCL_SOCKET_IFNAME`。
 
 四份脚本对应关系：
