@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MASTER_ADDR="${MASTER_ADDR:-10.31.10.210}"
+MASTER_ADDR="${MASTER_ADDR:-10.31.10.13}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 NNODES="${NNODES:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-16}"
