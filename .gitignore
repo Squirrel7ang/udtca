@@ -40,3 +40,7 @@ fineweb_data/
 .idea/
 *.swp
 .DS_Store
+
+# ---- 本地工具 / 误建目录 ----
+.claude/
+experiments/qwen14b/experiments/
