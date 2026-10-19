@@ -106,6 +106,7 @@ Repository and subdirectory README files:
 - [polar-sgd README](polar-sgd/README.md)
 - [polar-sgd Chinese README](polar-sgd/README_cn.md)
 - [udtca-config README](udtca-config/README.md)
+- [Live metrics API guide](udtca-config/qwen14b/API_USAGE.md)
 - [quantization experiments README](experiments/quantization/README.md)
 - [quantization experiments Chinese README](experiments/quantization/README_cn.md)
 - [Qwen14B experiments README](experiments/qwen14b/README.md)
@@ -146,6 +147,27 @@ It targets a two-node, 32-GPU topology:
 
 See [experiments/qwen14b/README.md](experiments/qwen14b/README.md) for the
 node-0/node-1 launch commands.
+
+A one-command 4-case matrix runner and a live metrics service are also available
+under the `udtca-config` submodule:
+
+- [`udtca-config/qwen14b/run.py`](udtca-config/qwen14b/run.py) — runs the four
+  cases in `run_cases.json` (2gbit / 1gbit × polar / baseline) back to back,
+  applies `tc`, and prints plus persists the end-to-end comparison
+  (`run_log/run_<timestamp>/summary.md`, full stdout in `run.log`).
+- [`udtca-config/qwen14b/start_metrics_api.py`](udtca-config/qwen14b/start_metrics_api.py) —
+  read-only HTTP + SSE metrics API (DP/PP overlap, bitscom compression,
+  4-case overview) that tails the run logs; it does not touch the training
+  processes or GPUs. Start it on its own or together with training:
+
+  ```bash
+  /root/miniconda3/envs/udtca/bin/python3.10 \
+      udtca-config/qwen14b/start_metrics_api.py --port 8000
+  # interactive docs: http://10.31.10.13:8000/docs
+  ```
+
+  Full client-facing documentation (endpoints, fields, SSE usage,
+  troubleshooting): [API_USAGE.md](udtca-config/qwen14b/API_USAGE.md).
 
 ### YOLOv8 DDP partial-gradient sync
 

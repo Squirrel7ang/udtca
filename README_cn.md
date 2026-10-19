@@ -428,14 +428,17 @@ ssh 10.31.10.177 '/usr/local/corex-4.4.0/bin/ixsmi --query-gpu=index,memory.used
 udtca-config/
 ├── common/     case_common.py（公共库）+ orchestrator.py（通用编排流程）
 ├── qwen14b/    default.json / test.json / generate_and_run.py（主入口）/ _run_baseline.py（内部脚本）
+│               run_cases.json + run.py（4-case 一键跑）/ start_metrics_api.py（实时指标 API）
 ├── qwenvl8b/   同上四个文件
 └── utils/      watch_bandwidth.py / collect_case_logs.py / trace_processor.py
-                download_fineweb.py / build_comm_opt_data.py
+                download_fineweb.py / build_comm_opt_data.py / check_k8s_port_conflict.py
 ```
 
 | 文件 | 作用 |
 |---|---|
-| `<exp>/generate_and_run.py` | **唯一对外入口**。按 `test.json` 逐条跑，按每条的 `baseline` 标记分派 polar / baseline |
+| `<exp>/generate_and_run.py` | **主入口**。按 `test.json` 逐条跑，按每条的 `baseline` 标记分派 polar / baseline |
+| `qwen14b/run.py` | 4-case 一键跑（`run_cases.json`：2gbit/1gbit × polar/baseline），跑完输出并持久化对比；标准输出落 `run.log` |
+| `qwen14b/start_metrics_api.py` | 实时指标 API（HTTP + SSE），见 3.11 节 |
 | `<exp>/_run_baseline.py` | 内部脚本（名字带 `_` 前缀，一般不直接调用）：只跑 baseline，共用同一套 case 编号 |
 | `<exp>/default.json` / `test.json` | 默认超参 / 实验矩阵 |
 | `common/case_common.py` | 核心库：两节点命令封装、`SETUP_CMDS`、case 编号与 `case.json` 读写、GPU 检查、日志回收 |
@@ -622,6 +625,33 @@ python udtca-config/utils/build_comm_opt_data.py --dest /data1/tangruijing/comm-
 > `build_comm_opt_data.py` 遵守两条硬规则：**只做复制 / 新建，绝不移动、
 > 删除或修改任何源文件**；目标目录下已存在且大小一致的文件会跳过（可增量重跑）。
 
+### 3.11 实时指标 API（重叠率 / 压缩量 / 4-case 对比）
+
+除了跑完看终端汇总，还可以起一个只读的指标服务：它 tail `run_log/<run>/<case>/`
+下的训练日志，通过 HTTP / SSE 提供 DP-PP 重叠率和 bitscom 压缩量，适合前端做
+实时看板。**API 不碰训练进程、不占 GPU、不影响正在跑的训练。**
+
+```bash
+# 只起 API：自动盯 run_log 下最新一次 run
+/root/miniconda3/envs/udtca/bin/python3.10 \
+    udtca-config/qwen14b/start_metrics_api.py --port 8000
+
+# 训练 + API 一起起（4 个 case、开 TC，Ctrl-C 会一并收掉训练）
+/root/miniconda3/envs/udtca/bin/python3.10 \
+    udtca-config/qwen14b/start_metrics_api.py \
+        --with-training --max-steps 5 --port 8000
+```
+
+- 健康检查：`curl http://127.0.0.1:8000/api/v1/health`
+- 交互式接口文档：`http://10.31.10.13:8000/docs`
+- 主要接口：`/api/v1/metrics/latest`、`/metrics/history`、`/metrics/stream`（SSE）、
+  `/api/v1/overview`（4-case 对比）
+- **完整说明（前端怎么调、字段含义、排障）：**
+  [`udtca-config/qwen14b/API_USAGE.md`](udtca-config/qwen14b/API_USAGE.md)
+
+> 必须用 conda 的 `python3.10`；系统自带的 `python3` 是 3.8，起不来 fastapi。
+> `.api_deps` 已装好时不需要再传 `--install-deps`。
+
 ---
 
 ## 4. 踩过的坑
@@ -647,6 +677,7 @@ python udtca-config/utils/build_comm_opt_data.py --dest /data1/tangruijing/comm-
 - [bitscom README](bitscom/README.md) / [中文](bitscom/README_cn.md)
 - [polar-sgd README](polar-sgd/README.md) / [中文](polar-sgd/README_cn.md)
 - [udtca-config README](udtca-config/README.md)
+- [实时指标 API 使用说明](udtca-config/qwen14b/API_USAGE.md)
 - [Qwen14B 实验 README](experiments/qwen14b/README.md)
 - [QwenVL8B 实验 README](experiments/qwenvl8b/README.md)
 - [量化实验 README](experiments/quantization/README.md) / [中文](experiments/quantization/README_cn.md)
