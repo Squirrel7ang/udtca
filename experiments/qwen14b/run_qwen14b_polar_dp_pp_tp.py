@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import argparse
+import re
 import sys
 import socket
 from pathlib import Path
@@ -220,6 +221,31 @@ def _node_dataset_cache_path(args) -> Path:
     )
 
 
+def _reuse_larger_dataset_cache(cache_path: Path) -> Optional[Path]:
+    """复用同配置、样本数更大的 token 缓存。
+
+    文件名里的 `samplesN` 由 max-steps × micro-batches 推出来，所以换个
+    max-steps（比如冒烟 3 步 vs 5 步）就要重新从 HuggingFace 拉数据建缓存；
+    外网不通时训练会直接挂在 `load_dataset`。多出来的样本不影响训练（只按
+    step 取前 N 个 block），因此优先复用已有的、样本数 ≥ 目标的缓存。
+    """
+    m = re.match(r"(?P<head>.+_samples)(?P<n>\d+)(?P<tail>_.+\.pt)$", cache_path.name)
+    if not m:
+        return None
+    head, want, tail = m.group("head"), int(m.group("n")), m.group("tail")
+    candidates = []
+    for path in cache_path.parent.glob(f"{head}*{tail}"):
+        cm = re.fullmatch(re.escape(head) + r"(\d+)" + re.escape(tail), path.name)
+        if not cm:
+            continue
+        count = int(cm.group(1))
+        if count >= want:
+            candidates.append((count, path))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
 def _materialize_token_cache(args, tokenizer, cache_path: Path) -> None:
     if cache_path.exists() and not args.refresh_dataset_cache:
         return
@@ -275,6 +301,15 @@ def _materialize_token_cache(args, tokenizer, cache_path: Path) -> None:
 def _prepare_node_local_hf_cache(args) -> Path:
     cache_path = _node_dataset_cache_path(args)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    # 精确样本数的缓存不存在时，先看能不能复用更大的（避免为了多跑几步就去拉数据集）
+    if not cache_path.exists() and not args.refresh_dataset_cache:
+        reused = _reuse_larger_dataset_cache(cache_path)
+        if reused is not None:
+            if local_rank == 0:
+                print(f"[dataset-cache] 复用已有缓存 {reused.name}（目标 {cache_path.name}）",
+                      flush=True)
+            cache_path = reused
 
     if local_rank == 0:
         tokenizer_name = args.tokenizer_name or args.model_name
