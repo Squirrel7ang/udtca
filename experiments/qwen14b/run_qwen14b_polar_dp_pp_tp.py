@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import os
 import argparse
+import datetime
 import re
 import sys
 import socket
 from pathlib import Path
+
+import faulthandler as _faulthandler
+import signal as _signal
+_faulthandler.register(_signal.SIGUSR1, all_threads=True)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (
@@ -59,9 +64,18 @@ def create_lowbit_dp_group(dp_group):
     dist.all_gather_object(gathered, my_ranks)
     dp_rank_groups = sorted({tuple(int(r) for r in ranks) for ranks in gathered})
 
+    # bitscom 的 LowBit ProcessGroup 自身持有 NCCL timeout；显式传入，
+    # 避免依赖默认值（10/30 分钟）导致通信挂死时长期占卡。
+    _lb_watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+    _lb_pg_timeout = datetime.timedelta(
+        seconds=_lb_watchdog_s
+        + float(os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "60"))
+    )
     selected_group = None
     for ranks in dp_rank_groups:
-        group = dist.new_group(ranks=list(ranks), backend="lowbit")
+        group = dist.new_group(
+            ranks=list(ranks), backend="lowbit", timeout=_lb_pg_timeout
+        )
         if ranks == my_ranks:
             selected_group = group
 
@@ -338,6 +352,27 @@ def _prepare_node_local_hf_cache(args) -> Path:
 # -----------------------------
 # Qwen Model Partitioning for Pipeline Parallelism
 # -----------------------------
+
+def _udtca_stage_debug(message: str) -> None:
+    import os
+    import time
+    if os.environ.get("UDTCA_STAGE_DEBUG", "0").lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+    except Exception:
+        rank, world = -1, -1
+    print(
+        f"[stage-debug rank={rank}/{world} pid={os.getpid()} t={time.strftime("%H:%M:%S")}] {message}",
+        flush=True,
+    )
+
+
 def partition_qwen_model(
     model,
     stage_idx: int,
@@ -476,6 +511,13 @@ def partition_qwen_model(
     
     # Custom forward method for partitioned model with proper RoPE handling
     def custom_forward(input_ids_or_hidden, attention_mask=None):
+        model._udtca_fwd_count = int(getattr(model, "_udtca_fwd_count", 0)) + 1
+        _fwd_call = model._udtca_fwd_count
+        _udtca_stage_debug(
+            f"fwd_enter stage={stage_idx} call={_fwd_call} "
+            f"in_shape={tuple(input_ids_or_hidden.shape)} "
+            f"dtype={input_ids_or_hidden.dtype} dev={input_ids_or_hidden.device}"
+        )
         debug_forward = int(debug_nan_steps or 0) > 0
         debug_count = int(getattr(model, "_polar_forward_debug_count", 0))
         if debug_forward and debug_count < int(debug_nan_steps):
@@ -498,6 +540,11 @@ def partition_qwen_model(
             hidden_states = input_ids_or_hidden
             if torch.is_floating_point(hidden_states) and not hidden_states.requires_grad:
                 hidden_states.requires_grad_(True)
+
+        _udtca_stage_debug(
+            f"fwd_embed_done stage={stage_idx} call={_fwd_call} "
+            f"shape={tuple(hidden_states.shape)}"
+        )
 
         # Get sequence length for position embeddings
         seq_length = hidden_states.shape[1]
@@ -526,7 +573,14 @@ def partition_qwen_model(
         decoder_attention_mask = layer_attention_mask(attention_mask)
 
         # Pass through layers
+        _udtca_stage_debug(
+            f"fwd_layers_begin stage={stage_idx} call={_fwd_call} "
+            f"n_local_layers={len(model.model.layers)}"
+        )
         for layer_idx, layer in enumerate(model.model.layers):
+            _udtca_stage_debug(
+                f"layer_enter stage={stage_idx} call={_fwd_call} local_layer={layer_idx}"
+            )
             if isinstance(layer, torch.nn.Identity):
                 hidden_states = layer(hidden_states)
             else:
@@ -542,6 +596,9 @@ def partition_qwen_model(
                     hidden_states = layer_outputs[0]
                 else:
                     hidden_states = layer_outputs
+                _udtca_stage_debug(
+                    f"layer_exit stage={stage_idx} call={_fwd_call} local_layer={layer_idx}"
+                )
                 if debug_forward and debug_count < int(debug_nan_steps):
                     hs_float = hidden_states.detach().float()
                     if not bool(torch.isfinite(hs_float).all().item()):
@@ -551,6 +608,10 @@ def partition_qwen_model(
                             flush=True,
                         )
                         break
+
+        _udtca_stage_debug(
+            f"fwd_layers_done stage={stage_idx} call={_fwd_call}"
+        )
 
         # Apply final norm if present
         if hasattr(model.model, 'norm') and model.model.norm is not None:
@@ -564,6 +625,10 @@ def partition_qwen_model(
         else:
             output = hidden_states
 
+        _udtca_stage_debug(
+            f"fwd_exit stage={stage_idx} call={_fwd_call} "
+            f"out_shape={tuple(output.shape)}"
+        )
         if debug_forward and debug_count < int(debug_nan_steps):
             out_float = output.detach().float()
             print(
@@ -723,6 +788,75 @@ def vocab_parallel_lm_loss(
 # -----------------------------
 # Main Training Loop
 # -----------------------------
+def shutdown_distributed() -> None:
+    """Ordered NCCL teardown: barrier -> subgroup comms -> world comm.
+
+    Corex 4.5.0 aborts NCCL communicators in ProcessGroup destructors when
+    destroy_process_group() was not called, and an implicit abort can corrupt
+    device VA space (XID 24). Destroy every subgroup explicitly, in the same
+    order on all ranks, before the world group.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    try:
+        rank = dist.get_rank()
+    except Exception:
+        rank = -1
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        dist.barrier()
+        print(f"[shutdown][rank={rank}] barrier ok", flush=True)
+    except Exception as exc:
+        print(f"[shutdown][rank={rank}] barrier failed: {exc!r}", flush=True)
+
+    world = getattr(getattr(dist, "group", None), "WORLD", None)
+    groups = []
+    try:
+        from torch.distributed import distributed_c10d as _dc
+        pg_map = list(_dc._world.pg_map.keys())
+    except Exception:
+        pg_map = []
+    for g in pg_map:
+        if g is world:
+            continue
+        try:
+            ranks = tuple(dist.get_process_group_ranks(g))
+        except Exception:
+            ranks = ()
+        try:
+            tag = _dc._get_group_tag(g)
+        except Exception:
+            tag = ""
+        groups.append((ranks, tag, g))
+    # Deterministic across ranks: same set of PGs, same destroy order.
+    groups.sort(key=lambda item: (item[0], item[1]))
+
+    destroyed = 0
+    for ranks, tag, g in groups:
+        try:
+            dist.destroy_process_group(g)
+            destroyed += 1
+        except Exception as exc:
+            print(
+                f"[shutdown][rank={rank}] destroy subgroup ranks={ranks} "
+                f"tag={tag!r} failed: {exc!r}",
+                flush=True,
+            )
+    print(
+        f"[shutdown][rank={rank}] destroyed {destroyed}/{len(groups)} subgroups",
+        flush=True,
+    )
+    try:
+        dist.destroy_process_group()
+        print(f"[shutdown][rank={rank}] world destroyed", flush=True)
+    except Exception as exc:
+        print(f"[shutdown][rank={rank}] world destroy failed: {exc!r}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polar-SGD pretraining for Qwen2.5 models")
     
@@ -830,7 +964,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2)
     
     # Mixed precision and optimization
-    parser.add_argument("--use-flash-attn", action="store_true", default=True)
+    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--fp16", action="store_true", default=False)
     parser.add_argument(
@@ -1011,7 +1145,15 @@ def main():
         bitscom_module.init(bitwidth=args.bitwidth)
     
     # Initialize distributed
-    dist.init_process_group(backend="nccl", init_method="env://")
+    _watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+    _pg_timeout_s = _watchdog_s + float(
+        os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "60")
+    )
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        timeout=datetime.timedelta(seconds=_pg_timeout_s),
+    )
     world_size = dist.get_world_size()
     if dist.get_rank() == 0:
         print(
@@ -1162,6 +1304,10 @@ def main():
     trainer.lowbit_group = lowbit_group
 
     trainer.train()
+    # Ordered teardown: subgroups first, world last. Destroying world first
+    # leaves the remaining mesh PGs to be aborted by destructors, which is
+    # exactly the path that corrupts Corex device VA space.
+    shutdown_distributed()
 
 
 if __name__ == "__main__":
