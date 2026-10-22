@@ -24,6 +24,76 @@ Polar-SGD pretraining for Qwen2.5 models with DP+PP+TP parallelism.
 Experiment entrypoint for udtca/experiments/qwen14b.
 """
 
+
+def _auto_shutdown(reason: str, exit_code: int) -> None:
+    """Roll the job back in-process: revoke every comm, exit once quiescent.
+
+    Nothing is signalled to the other ranks; the handshake is a per-node file
+    barrier, because exiting while a peer still has a collective in flight is
+    what corrupts the GPU VA space (XID 24).
+    """
+    try:
+        _revoke_dir = os.environ.get(
+            "UDTCA_REVOKE_PY_DIR", str(Path(__file__).resolve().parent)
+        )
+        if _revoke_dir not in sys.path:
+            sys.path.insert(0, _revoke_dir)
+        from nccl_revoke import coordinated_shutdown
+
+        coordinated_shutdown(
+            reason,
+            exit_code=exit_code,
+            device_index=int(os.environ.get("LOCAL_RANK", "0")),
+            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "20")),
+        )
+    except Exception as exc:
+        # Without a coordinated rollback, exiting could wedge the peers.
+        print(f"[auto-shutdown] unavailable: {exc!r}", flush=True)
+
+
+def _install_auto_shutdown() -> None:
+    """Make faults end in an orderly self-exit instead of an external kill.
+
+    - SIGTERM/SIGINT (torchrun stopping siblings, Ctrl-C): revoke first, so
+      the teardown can no longer interrupt an in-flight collective.
+    - uncaught exceptions (main or worker thread): same path.
+
+    Both are safety nets for faults that surface in Python. A hang inside NCCL
+    is caught by the comm watchdog in the training loop, which runs on its own
+    thread and is not subject to GIL-bound signal delivery.
+    """
+
+    def _on_signal(signum, frame):
+        name = _signal.Signals(signum).name if signum in _signal.Signals._value2member_map_ else str(signum)
+        _auto_shutdown(f"signal {signum} ({name})", 128 + signum)
+
+    for _sig in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_sig, _on_signal)
+        except Exception:
+            pass
+
+    _orig_excepthook = sys.excepthook
+
+    def _excepthook(exc_type, exc, tb):
+        _orig_excepthook(exc_type, exc, tb)
+        _auto_shutdown(f"uncaught {exc_type.__name__}: {exc}", 1)
+
+    sys.excepthook = _excepthook
+
+    import threading
+
+    def _thread_excepthook(args):
+        print(
+            f"[auto-shutdown] uncaught in thread {args.thread.name}: "
+            f"{args.exc_value!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _auto_shutdown(f"thread {args.thread.name}: {args.exc_value!r}", 1)
+
+    threading.excepthook = _thread_excepthook
+
 from psgd.parallelism.polar.wrapper import PolarParallel
 
 import torch
@@ -64,12 +134,12 @@ def create_lowbit_dp_group(dp_group):
     dist.all_gather_object(gathered, my_ranks)
     dp_rank_groups = sorted({tuple(int(r) for r in ranks) for ranks in gathered})
 
-    # bitscom 的 LowBit ProcessGroup 自身持有 NCCL timeout；显式传入，
-    # 避免依赖默认值（10/30 分钟）导致通信挂死时长期占卡。
-    _lb_watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+    # 看门狗只 revoke、不退出；PG timeout 设得远大于看门狗，避免 torch
+    # 自己在超时后 abort comm / 退出进程（那会触发 torchrun SIGTERM -> XID 24）。
+    _lb_watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "60"))
     _lb_pg_timeout = datetime.timedelta(
         seconds=_lb_watchdog_s
-        + float(os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "60"))
+        + float(os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "21600"))
     )
     selected_group = None
     for ranks in dp_rank_groups:
@@ -799,6 +869,15 @@ def shutdown_distributed() -> None:
     if not dist.is_available() or not dist.is_initialized():
         return
     try:
+        from nccl_revoke import exit_now, revoke_requested
+    except Exception:
+        exit_now = None
+        revoke_requested = None
+    if revoke_requested is not None and revoke_requested():
+        # A watchdog already revoked the comms; destroying them now would race
+        # the rollback. Join it and let it exit the process.
+        exit_now(3)
+    try:
         rank = dist.get_rank()
     except Exception:
         rank = -1
@@ -1145,9 +1224,11 @@ def main():
         bitscom_module.init(bitwidth=args.bitwidth)
     
     # Initialize distributed
-    _watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+    # 看门狗只 revoke、不退出，PG timeout 因此设得远大于它：进程绝不因
+    # torch 自己的 timeout 而退出（退出会让 torchrun SIGTERM 同伴 -> XID 24）。
+    _watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "60"))
     _pg_timeout_s = _watchdog_s + float(
-        os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "60")
+        os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "21600")
     )
     dist.init_process_group(
         backend="nccl",
@@ -1309,7 +1390,23 @@ def main():
     # exactly the path that corrupts Corex device VA space.
     shutdown_distributed()
 
+    # Corex 4.5.0 在解释器退出阶段还会对残留 NCCL comm 做 abort，
+    # abort 可能挂死（"Future for ProcessGroup abort timed out"）。
+    # 所有 ProcessGroup 已显式销毁，直接跳过析构退出。
+    # 需要排查退出路径时设 UDTCA_FAST_EXIT=0。
+    if os.environ.get("UDTCA_FAST_EXIT", "1") == "1":
+        try:
+            from nccl_revoke import exit_now
+        except Exception:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        # No-op unless a rollback is in progress; then it waits for the node.
+        exit_now(0)
+
 
 if __name__ == "__main__":
     from dataclasses import dataclass
+
+    _install_auto_shutdown()
     main()
