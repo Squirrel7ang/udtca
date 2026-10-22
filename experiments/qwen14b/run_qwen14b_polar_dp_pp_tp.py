@@ -2,6 +2,7 @@
 import os
 import argparse
 import datetime
+import random
 import re
 import sys
 import socket
@@ -937,12 +938,32 @@ def shutdown_distributed() -> None:
         print(f"[shutdown][rank={rank}] world destroy failed: {exc!r}", flush=True)
 
 
+def _set_seed(seed: int) -> None:
+    """所有 rank 用同一个种子初始化，保证实验可复现。
+
+    不开 `--init-from-pretrained` 时模型是 `from_config` 随机初始化的，之前
+    没有设种子，每个 rank 抽到的权重都不同：同一 DP 组的两个副本实际上是
+    两个不同的模型，baseline 和 bitscom 之间也没法对比 loss 曲线。
+    """
+    seed = int(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polar-SGD pretraining for Qwen2.5 models")
     
     # Model and tokenizer
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--tokenizer-name", type=str, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="随机初始化种子。所有 rank 用同一个值。",
+    )
     
     # Dataset
     parser.add_argument("--dataset-name-or-path", type=str, default="HuggingFaceFW/fineweb")
@@ -1170,13 +1191,9 @@ def main():
     args = parser.parse_args()
 
     if args.method == "bitscom" and not args.using_polar:
-        # Valid on purpose: this is the "baseline + quantized DP grad sync"
-        # arm of the 2x2 matrix. The grad sync uses LowBitGroup, nothing else.
-        print(
-            "[info] --method bitscom without POLAR: DP gradient sync will be "
-            "quantized through the lowbit backend.",
-            flush=True,
-        )
+        # "baseline + 量化" 那一臂：只有 DP 梯度同步走 lowbit。
+        print("[info] bitscom without POLAR: only DP grad sync is quantized",
+              flush=True)
     if args.using_polar and args.method != "bitscom":
         print(
             "[warn] POLAR is enabled without bitscom; DP communication will "
@@ -1327,8 +1344,11 @@ def main():
 
     # Build tokenizer
     tokenizer = build_tokenizer(cfg, local_files_only=True)
-    
-    # Build and partition Qwen model
+
+    # Build and partition Qwen model. Seed right before the build so every
+    # rank (DP replicas included) starts from identical weights.
+    _set_seed(args.seed)
+    print(f"[seed] init seed={args.seed} rank={dist.get_rank()}", flush=True)
     model = build_qwen_model(cfg, local_files_only=True)
     stage_idx = pp_mesh.get_local_rank()
     tp_rank = device_mesh["tp"].get_local_rank() if tp_size > 1 else 0
@@ -1391,9 +1411,7 @@ def main():
     )
     trainer.lowbit_group = lowbit_group
 
-    # 启动时先确认「卡死能不能被回滚」：把每个 ProcessGroup 能不能拿到 cancel
-    # 入口（raw ncclComm_t 的 revoke/abort，或 backend 自己的 abort/revoke）打出来。
-    # 只枚举、不 revoke，所以在正常路径上无副作用。
+    # 启动时打印每个 PG 是否可取消（只枚举，不 revoke）。
     if os.environ.get("UDTCA_REVOKE_PROBE", "1") != "0":
         try:
             from nccl_revoke import _nccl_comms, revoke_summary

@@ -100,13 +100,22 @@ def _load_nccl() -> ctypes.CDLL:
                 f"{path} exports neither ncclCommRevoke nor ncclCommAbort"
             )
             continue
-        lib.ncclCommGetAsyncError.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int),
-        ]
-        lib.ncclCommGetAsyncError.restype = ctypes.c_int
-        lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
-        lib.ncclCommDestroy.restype = ctypes.c_int
+        try:
+            lib.ncclCommGetAsyncError.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            lib.ncclCommGetAsyncError.restype = ctypes.c_int
+        except AttributeError:
+            # Without it we cannot tell when the cancel took effect; try the
+            # next candidate instead of failing outright.
+            last_err = AttributeError(f"{path} exports no ncclCommGetAsyncError")
+            continue
+        try:
+            lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+            lib.ncclCommDestroy.restype = ctypes.c_int
+        except AttributeError:
+            lib.ncclCommDestroy = None  # optional: only used with destroy=True
         lib._udtca_revoke_symbol = bound  # type: ignore[attr-defined]
         _log(f"loaded {path} (cancel primitive: {bound})")
         return lib
@@ -147,13 +156,10 @@ def _nccl_comms(device_index: int | None = None):
         return []
     # torch 2.7 keeps the registry on a _World object, newer builds also expose
     # the flat _pg_map; probe both so the same file works on 2.7.1 and 2.10.0.
-    pg_map = None
-    for attr in ("_pg_map",):
-        registry = getattr(dc, attr, None)
-        if isinstance(registry, dict) and registry:
-            pg_map = list(registry.keys())
-            break
-    if pg_map is None:
+    registry = getattr(dc, "_pg_map", None)
+    if isinstance(registry, dict) and registry:
+        pg_map = list(registry.keys())
+    else:
         try:
             pg_map = list(dc._world.pg_map.keys())
         except Exception:
@@ -327,7 +333,7 @@ def revoke_all(
             time.sleep(0.05)
 
     for r in results:
-        if r[3] and destroy:
+        if r[3] and destroy and lib.ncclCommDestroy is not None:
             r[4] = lib.ncclCommDestroy(ctypes.c_void_p(r[1]))
             _log(f"destroy {r[0]} rc={r[4]}")
         elif not r[3]:
@@ -567,6 +573,19 @@ def exit_now(exit_code: int) -> None:
         coordinated_shutdown(
             "process exit requested after a revoke", exit_code=exit_code
         )
+        # It only returns when the rollback was refused (nothing cancelled):
+        # exiting here would tear down with collectives in flight, so stay
+        # alive exactly like coordinated_shutdown does.
+        summary = revoke_summary()
+        if (
+            (summary["comms"] > 0 or summary["groups"] > 0)
+            and summary["revoked"] == 0
+            and os.environ.get("UDTCA_REVOKE_DEGRADED_EXIT", "0") != "1"
+        ):
+            _log("exit suppressed: rollback degraded, staying alive")
+            _flush_logs()
+            while True:
+                time.sleep(60)
     _flush_logs()
     os._exit(exit_code)
 
