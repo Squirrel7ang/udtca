@@ -44,7 +44,7 @@ def _auto_shutdown(reason: str, exit_code: int) -> None:
             reason,
             exit_code=exit_code,
             device_index=int(os.environ.get("LOCAL_RANK", "0")),
-            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "20")),
+            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "10")),
         )
     except Exception as exc:
         # Without a coordinated rollback, exiting could wedge the peers.
@@ -136,7 +136,7 @@ def create_lowbit_dp_group(dp_group):
 
     # 看门狗只 revoke、不退出；PG timeout 设得远大于看门狗，避免 torch
     # 自己在超时后 abort comm / 退出进程（那会触发 torchrun SIGTERM -> XID 24）。
-    _lb_watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "60"))
+    _lb_watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300"))
     _lb_pg_timeout = datetime.timedelta(
         seconds=_lb_watchdog_s
         + float(os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "21600"))
@@ -437,8 +437,9 @@ def _udtca_stage_debug(message: str) -> None:
         world = dist.get_world_size()
     except Exception:
         rank, world = -1, -1
+    stamp = time.strftime("%H:%M:%S")
     print(
-        f"[stage-debug rank={rank}/{world} pid={os.getpid()} t={time.strftime("%H:%M:%S")}] {message}",
+        f"[stage-debug rank={rank}/{world} pid={os.getpid()} t={stamp}] {message}",
         flush=True,
     )
 
@@ -1169,7 +1170,13 @@ def main():
     args = parser.parse_args()
 
     if args.method == "bitscom" and not args.using_polar:
-        raise ValueError("--method bitscom requires --using-polar true")
+        # Valid on purpose: this is the "baseline + quantized DP grad sync"
+        # arm of the 2x2 matrix. The grad sync uses LowBitGroup, nothing else.
+        print(
+            "[info] --method bitscom without POLAR: DP gradient sync will be "
+            "quantized through the lowbit backend.",
+            flush=True,
+        )
     if args.using_polar and args.method != "bitscom":
         print(
             "[warn] POLAR is enabled without bitscom; DP communication will "
@@ -1226,7 +1233,7 @@ def main():
     # Initialize distributed
     # 看门狗只 revoke、不退出，PG timeout 因此设得远大于它：进程绝不因
     # torch 自己的 timeout 而退出（退出会让 torchrun SIGTERM 同伴 -> XID 24）。
-    _watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "60"))
+    _watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300"))
     _pg_timeout_s = _watchdog_s + float(
         os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "21600")
     )
@@ -1383,6 +1390,25 @@ def main():
         baseline_mode=args.baseline_mode,
     )
     trainer.lowbit_group = lowbit_group
+
+    # 启动时先确认「卡死能不能被回滚」：把每个 ProcessGroup 能不能拿到 cancel
+    # 入口（raw ncclComm_t 的 revoke/abort，或 backend 自己的 abort/revoke）打出来。
+    # 只枚举、不 revoke，所以在正常路径上无副作用。
+    if os.environ.get("UDTCA_REVOKE_PROBE", "1") != "0":
+        try:
+            from nccl_revoke import _nccl_comms, revoke_summary
+
+            _probe = _nccl_comms(int(os.environ.get("LOCAL_RANK", "0")))
+            _cancelable = sum(1 for e in _probe if len(e) > 2 and e[2])
+            _ptr = sum(1 for e in _probe if not (len(e) > 2 and e[2]))
+            print(
+                f"[revoke-probe] rank={dist.get_rank()} "
+                f"groups={revoke_summary().get('groups', 0)} "
+                f"cancelable={len(_probe)} (ptr={_ptr}, backend-abort={_cancelable})",
+                flush=True,
+            )
+        except Exception as _probe_exc:
+            print(f"[revoke-probe] unavailable: {_probe_exc!r}", flush=True)
 
     trainer.train()
     # Ordered teardown: subgroups first, world last. Destroying world first
