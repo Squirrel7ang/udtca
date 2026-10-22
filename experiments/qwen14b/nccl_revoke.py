@@ -52,36 +52,64 @@ def _log(msg: str) -> None:
 
 
 def _load_nccl() -> ctypes.CDLL:
-    candidates = []
+    """Load the nccl library torch already uses and bind a cancel primitive.
+
+    The bare soname comes first so the loader returns the *already loaded*
+    instance, which owns our ProcessGroups' ``ncclComm_t`` pointers; a second
+    copy from another Corex install would get the wrong pointers. Corex 4.4
+    exports only ``ncclCommAbort`` (same local cancel, no quiescence handle),
+    Corex 4.5 exports both; prefer revoke.
+    """
+    candidates = ["libnccl.so.2", "libnccl.so"]
     preload = os.environ.get("LD_PRELOAD", "")
     candidates += [p for p in preload.split(":") if "libnccl" in p]
-    corex = os.environ.get("COREX_PATH") or os.environ.get("COREX_TOOLKIT")
-    if corex:
+    for env in ("COREX_PATH", "COREX_TOOLKIT"):
+        corex = os.environ.get(env)
+        if not corex:
+            continue
         candidates.append(os.path.join(corex, "lib64", "libnccl.so.2"))
         candidates.append(os.path.join(corex, "lib", "libnccl.so.2"))
+        candidates.append(os.path.join(corex, "ixccl", "lib64", "libnccl.so.2"))
     found = ctypes.util.find_library("nccl")
     if found:
         candidates.append(found)
+    candidates.append("/usr/local/corex/lib64/libnccl.so.2")
 
     last_err = None
     for path in candidates:
-        if not path or not os.path.exists(path):
+        if not path:
             continue
         try:
             lib = ctypes.CDLL(path)
-            lib.ncclCommRevoke.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            lib.ncclCommRevoke.restype = ctypes.c_int
-            lib.ncclCommGetAsyncError.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_int),
-            ]
-            lib.ncclCommGetAsyncError.restype = ctypes.c_int
-            lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
-            lib.ncclCommDestroy.restype = ctypes.c_int
-            _log(f"loaded {path}")
-            return lib
-        except (OSError, AttributeError) as exc:
+        except OSError as exc:
             last_err = exc
+            continue
+        bound = None
+        for name, argtypes in (
+            ("ncclCommRevoke", [ctypes.c_void_p, ctypes.c_int]),
+            ("ncclCommAbort", [ctypes.c_void_p]),
+        ):
+            fn = getattr(lib, name, None)
+            if fn is None:
+                continue
+            fn.argtypes = argtypes
+            fn.restype = ctypes.c_int
+            bound = bound or name
+        if bound is None:
+            last_err = AttributeError(
+                f"{path} exports neither ncclCommRevoke nor ncclCommAbort"
+            )
+            continue
+        lib.ncclCommGetAsyncError.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.ncclCommGetAsyncError.restype = ctypes.c_int
+        lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+        lib.ncclCommDestroy.restype = ctypes.c_int
+        lib._udtca_revoke_symbol = bound  # type: ignore[attr-defined]
+        _log(f"loaded {path} (cancel primitive: {bound})")
+        return lib
     raise RuntimeError(f"cannot load an nccl library with revoke support: {last_err}")
 
 
@@ -117,10 +145,19 @@ def _nccl_comms(device_index: int | None = None):
 
     if not dc.is_initialized():
         return []
-    try:
-        pg_map = list(dc._world.pg_map.keys())
-    except Exception:
-        pg_map = [dc.group.WORLD]
+    # torch 2.7 keeps the registry on a _World object, newer builds also expose
+    # the flat _pg_map; probe both so the same file works on 2.7.1 and 2.10.0.
+    pg_map = None
+    for attr in ("_pg_map",):
+        registry = getattr(dc, attr, None)
+        if isinstance(registry, dict) and registry:
+            pg_map = list(registry.keys())
+            break
+    if pg_map is None:
+        try:
+            pg_map = list(dc._world.pg_map.keys())
+        except Exception:
+            pg_map = [dc.group.WORLD]
 
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -129,6 +166,7 @@ def _nccl_comms(device_index: int | None = None):
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", device_index)
     comms = []
+    _last_revoke_summary["groups"] = len(pg_map)
     for pg in pg_map:
         # torch 2.10 wraps ProcessGroup in Python; the NCCL backend object
         # (the one exposing _comm_ptr) is reached through _get_backend.
@@ -148,26 +186,56 @@ def _nccl_comms(device_index: int | None = None):
                 )
                 _log(f"captured lowbit backend for ranks {ranks}")
                 continue
+            try:
+                backend_name = pg._get_backend_name()
+            except Exception:
+                backend_name = "?"
             _log(
                 f"skip non-NCCL backend {type(backend).__name__} "
                 f"for ranks {dc.get_process_group_ranks(pg)} "
-                f"(backend_name={pg._get_backend_name()})"
+                f"(backend_name={backend_name})"
             )
             continue
+        ranks = dc.get_process_group_ranks(pg)
+        name = f"rank{dc.get_rank()}-group{ranks}"
+        # Preferred: the raw ncclComm_t, so we can call ncclCommRevoke and poll
+        # for quiescence. Only some torch builds expose it.
+        ptr = None
         try:
-            ranks = dc.get_process_group_ranks(pg)
-            name = f"rank{dc.get_rank()}-group{ranks}"
             ptr = backend._comm_ptr()
         except Exception as exc:
-            _log(f"skip {type(backend).__name__}: {exc!r}")
-            continue
+            ptr_err = exc
+        else:
+            ptr_err = None
         if ptr and int(ptr) > 0:
             comms.append((name, int(ptr), None))
-        else:
-            _log(f"no comm pointer yet for {name} on device {device_index} (ptr={ptr})")
+            continue
+        # Fallback: ProcessGroupNCCL.abort() uses the comm handle internally.
+        # It is the same local cancel primitive, without a quiescence handle,
+        # so callers sleep briefly instead of polling GetAsyncError.
+        aborter = getattr(backend, "abort", None)
+        if callable(aborter):
+            comms.append((name, None, lambda f=aborter: (f() or 0)))
+            _log(
+                f"captured {name} via ProcessGroupNCCL.abort "
+                f"(ptr unavailable: {ptr_err!r})"
+            )
+            continue
+        _log(f"skip {type(backend).__name__}: no _comm_ptr and no abort() ({ptr_err!r})")
     if not comms:
         _log(f"no NCCL backend found among {len(pg_map)} groups on device {device_index}")
     return comms
+
+
+# Set by revoke_all so coordinated_shutdown can tell "revoked everything" from
+# "there was nothing to revoke" and "revoke is not available on this host".
+_last_revoke_summary = {"available": False, "groups": 0, "comms": 0, "revoked": 0}
+# Wall-clock start of this process: used to reject stale revoke notices.
+_PROCESS_START = time.time()
+
+
+def revoke_summary() -> dict:
+    return dict(_last_revoke_summary)
 
 
 def revoke_all(
@@ -186,17 +254,23 @@ def revoke_all(
     Returns a list of (name, ptr, revoke_rc, quiesce_ok, destroy_rc) for logging.
     Never raises: this runs on the failure path.
     """
-    try:
-        lib = _nccl_lib()
-    except Exception as exc:
-        _log(f"revoke unavailable: {exc!r}")
-        return []
+    _last_revoke_summary.update(available=False, groups=0, comms=0, revoked=0)
 
     if comms is None:
         comms = _nccl_comms(device_index)
     if not comms:
         _log("no NCCL communicators to revoke")
         return []
+    _last_revoke_summary["comms"] = len(comms)
+
+    # The ctypes path needs the library; the abort()-based entries do not.
+    lib = None
+    if any(entry[1] for entry in comms):
+        try:
+            lib = _nccl_lib()
+            _last_revoke_summary["available"] = True
+        except Exception as exc:
+            _log(f"revoke-by-pointer unavailable: {exc!r}")
 
     # [name, ptr, revoke_rc, quiesced, destroy_rc]
     results = []
@@ -211,11 +285,27 @@ def revoke_all(
             except Exception as exc:
                 rc = -1
                 _log(f"lowbit revoke {name} failed: {exc!r}")
-            _log(f"revoke {name} via lowbit backend rc={rc}")
+            _log(f"revoke {name} via backend abort rc={rc}")
+            if rc == _NCCL_SUCCESS:
+                _last_revoke_summary["revoked"] += 1
             continue
-        rc = lib.ncclCommRevoke(ctypes.c_void_p(ptr), _NCCL_REVOKE_DEFAULT)
+        if lib is None:
+            _log(f"skip {name}: no revoke library for a raw comm pointer")
+            continue
+        if getattr(lib, "_udtca_revoke_symbol", "ncclCommRevoke") == "ncclCommAbort":
+            rc = lib.ncclCommAbort(ctypes.c_void_p(ptr))
+        else:
+            rc = lib.ncclCommRevoke(ctypes.c_void_p(ptr), _NCCL_REVOKE_DEFAULT)
         _log(f"revoke {name} ptr=0x{ptr:x} rc={rc}")
+        if rc == _NCCL_SUCCESS:
+            _last_revoke_summary["revoked"] += 1
         results.append([name, ptr, rc, False, None])
+
+    if lib is None:
+        # abort()-based entries have no quiescence handle; give the driver a
+        # moment to cancel the in-flight kernels before the caller exits.
+        time.sleep(min(1.0, max(0.1, quiesce_timeout_s / 4)))
+        return []
 
     deadline = time.monotonic() + quiesce_timeout_s
     pending = [r for r in results if r[2] == _NCCL_SUCCESS]
@@ -245,21 +335,27 @@ def revoke_all(
     return [tuple(r) for r in results]
 
 
-def _rendezvous_dir() -> str:
-    """Per-run directory used for the shutdown handshake.
+def _run_token() -> str:
+    """Stable within one torchrun job, unique across jobs.
 
-    torchrun gives every run a unique TORCHELASTIC_RUN_ID, so files from an
-    earlier job can never be mistaken for this one.
+    torch 2.7 leaves TORCHELASTIC_RUN_ID as the literal "none" without
+    --rdzv-id, which made every job share /tmp/udtca_revoke_none and a stale
+    notice killed the next run at step 0. Reject those values; the elastic
+    agent's pid is the per-run fallback all local ranks agree on.
     """
+    for key in ("TORCHELASTIC_RUN_ID", "MASTER_PORT"):
+        value = (os.environ.get(key) or "").strip()
+        if value and value.lower() not in {"none", "0"}:
+            return value
+    return f"ppid{os.getppid()}"
+
+
+def _rendezvous_dir() -> str:
+    """Per-run directory used for the shutdown handshake."""
     root = os.environ.get("UDTCA_REVOKE_DIR", "")
     if root:
         return root
-    token = (
-        os.environ.get("TORCHELASTIC_RUN_ID")
-        or os.environ.get("MASTER_PORT")
-        or str(os.getpid())
-    )
-    return os.path.join(tempfile.gettempdir(), f"udtca_revoke_{token}")
+    return os.path.join(tempfile.gettempdir(), f"udtca_revoke_{_run_token()}")
 
 
 def _notice_path() -> str:
@@ -297,9 +393,17 @@ def _write_atomic(path: str, text: str) -> None:
 
 
 def revoke_requested() -> bool:
-    """True once any rank of this node has started the shutdown handshake."""
+    """True once any rank of this node has started the shutdown handshake.
+
+    Notices older than this process are stale: the rendezvous directory is
+    per-run, but a reused port or a leftover /tmp file must never make a fresh
+    run decide to exit at step 0.
+    """
     try:
-        return os.path.exists(_notice_path())
+        path = _notice_path()
+        if not os.path.exists(path):
+            return False
+        return os.stat(path).st_mtime >= _PROCESS_START - 30.0
     except Exception:
         return False
 
@@ -334,9 +438,12 @@ def _flush_logs() -> None:
 
 
 # A shutdown can be started from several threads (watchdog, op wait, signal
-# handler). The first one runs it; the others park so they cannot race it.
+# handler). The first one runs it; the others wait so they cannot race it. If
+# the owner has to abort (revoke unavailable), the flag clears and the waiters
+# return so their caller can decide what to do.
 _exit_lock = threading.Lock()
 _exit_started = False
+_shutdown_active = threading.Event()
 
 
 def coordinated_shutdown(
@@ -363,14 +470,18 @@ def coordinated_shutdown(
     """
     global _exit_started
     with _exit_lock:
-        first = not _exit_started
-        _exit_started = True
+        first = not _shutdown_active.is_set()
+        if first:
+            _shutdown_active.set()
+            _exit_started = True
     if not first:
-        while True:
-            time.sleep(1.0)
+        # The owner exits the process on success; if it aborts, wake up.
+        while _shutdown_active.is_set():
+            time.sleep(0.2)
+        return
 
     if barrier_timeout_s is None:
-        barrier_timeout_s = float(os.environ.get("UDTCA_REVOKE_BARRIER_S", "20"))
+        barrier_timeout_s = float(os.environ.get("UDTCA_REVOKE_BARRIER_S", "5"))
     rank, world = _local_rank_world()
     _log(
         f"coordinated shutdown rank={rank}/{world} code={exit_code}: {reason}"
@@ -387,6 +498,28 @@ def coordinated_shutdown(
     except Exception as exc:
         _log(f"revoke failed: {exc!r}")
 
+    summary = revoke_summary()
+    if (
+        (summary["comms"] > 0 or summary["groups"] > 0)
+        and summary["revoked"] == 0
+        and os.environ.get("UDTCA_REVOKE_DEGRADED_EXIT", "0") != "1"
+    ):
+        # Nothing was cancelled: exiting now would tear down the CUDA context
+        # with collectives still in flight -- exactly the XID 24 path this
+        # module exists to avoid. Stay alive (torchrun will kill us if it must)
+        # and let the caller retry.
+        _log(
+            "ERROR: no communicator could be cancelled "
+            f"(lib available={summary['available']}, groups={summary['groups']}, "
+            f"comms={summary['comms']}); "
+            "refusing to exit. Set UDTCA_REVOKE_DEGRADED_EXIT=1 to exit anyway."
+        )
+        _flush_logs()
+        with _exit_lock:
+            _exit_started = False
+            _shutdown_active.clear()
+        return
+
     try:
         os.makedirs(_rendezvous_dir(), exist_ok=True)
         _write_atomic(
@@ -396,6 +529,9 @@ def coordinated_shutdown(
         _log(f"cannot write ready marker: {exc!r}")
         # Cannot synchronise with peers: do not exit underneath them.
         _flush_logs()
+        with _exit_lock:
+            _exit_started = False
+            _shutdown_active.clear()
         return
 
     deadline = time.monotonic() + barrier_timeout_s
