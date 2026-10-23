@@ -5,6 +5,7 @@ import datetime
 import random
 import re
 import sys
+import time
 import socket
 from pathlib import Path
 
@@ -331,6 +332,73 @@ def _reuse_larger_dataset_cache(cache_path: Path) -> Optional[Path]:
     return min(candidates, key=lambda item: item[0])[1]
 
 
+def _install_httpx_timeouts(read_s: float = 30.0) -> None:
+    """给没显式设置读超时的 httpx 请求补一个默认值。
+
+    huggingface_hub 用的是 `httpx.Client(timeout=None)`，列仓库目录的每一页
+    也不传 timeout，镜像断流时就会永远等在 ssl.read 上。读超时按单次 recv
+    计算，不影响下载大文件。
+    """
+    try:
+        import httpx
+    except ImportError:  # datasets 没装时走不到这里，保险起见
+        return
+    if getattr(httpx.Client, "_udtca_timeout_patched", False):
+        return
+    defaults = {"connect": 10.0, "read": float(read_s), "write": 30.0, "pool": 30.0}
+    original_send = httpx.Client.send
+
+    def send(self, request, **kwargs):
+        timeout = dict(request.extensions.get("timeout") or {})
+        for key, value in defaults.items():
+            if timeout.get(key) is None:
+                timeout[key] = value
+        request.extensions["timeout"] = timeout
+        return original_send(self, request, **kwargs)
+
+    httpx.Client.send = send
+    httpx.Client._udtca_timeout_patched = True
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """网络类错误才重试；配置写错、数据集不存在之类的直接抛。"""
+    if isinstance(exc, (FileNotFoundError, ValueError, KeyError, NotImplementedError)):
+        return False
+    try:
+        import httpx
+
+        network = (httpx.HTTPError, httpx.TransportError)
+    except ImportError:
+        network = ()
+    return isinstance(exc, network + (TimeoutError, ConnectionError, OSError))
+
+
+def _load_streaming_dataset(args, ds_kwargs):
+    """load_dataset(streaming=True)，带有限次重试。
+
+    paginate 的第一页不会重试（后续页由 http_backoff 重试），所以外面再兜一层。
+    """
+    attempts = max(1, int(os.environ.get("UDTCA_DATASET_RETRIES", "3")))
+    for attempt in range(1, attempts + 1):
+        try:
+            return load_dataset(
+                args.dataset_name_or_path,
+                **ds_kwargs,
+                split="train",
+                streaming=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 只按是否网络错误决定是否重试
+            if attempt >= attempts or not _is_retryable(exc):
+                raise
+            wait_s = 5 * attempt
+            print(
+                f"[dataset] 第 {attempt}/{attempts} 次解析失败"
+                f"（{type(exc).__name__}: {exc}），{wait_s}s 后重试",
+                flush=True,
+            )
+            time.sleep(wait_s)
+
+
 def _materialize_token_cache(args, tokenizer, cache_path: Path) -> None:
     if cache_path.exists() and not args.refresh_dataset_cache:
         return
@@ -339,13 +407,30 @@ def _materialize_token_cache(args, tokenizer, cache_path: Path) -> None:
     ds_kwargs = {}
     if args.dataset_config:
         ds_kwargs["name"] = args.dataset_config
+    # 显式给 data_files 时 datasets 不再列仓库目录，可直接跳过这一步。
+    if args.data_files:
+        ds_kwargs["data_files"] = [
+            item.strip() for item in args.data_files.split(",") if item.strip()
+        ]
 
-    dataset = load_dataset(
-        args.dataset_name_or_path,
-        **ds_kwargs,
-        split="train",
-        streaming=True,
+    print(
+        f"[dataset] resolve {args.dataset_name_or_path} "
+        f"config={args.dataset_config or '<default>'} "
+        f"data_files={args.data_files or '<auto>'} -> {cache_path.name}",
+        flush=True,
     )
+    # 万一还有别的地方会挂住：超过 UDTCA_DATASET_STALL_S 就把所有线程栈打出来
+    _install_httpx_timeouts(
+        float(os.environ.get("UDTCA_HTTP_READ_TIMEOUT_S", "30"))
+    )
+    stall_s = float(os.environ.get("UDTCA_DATASET_STALL_S", "120"))
+    if stall_s > 0:
+        _faulthandler.dump_traceback_later(stall_s, repeat=False)
+    try:
+        dataset = _load_streaming_dataset(args, ds_kwargs)
+    finally:
+        _faulthandler.cancel_dump_traceback_later()
+    print("[dataset] resolved, tokenizing", flush=True)
 
     input_blocks: List[torch.Tensor] = []
     label_blocks: List[torch.Tensor] = []
@@ -968,6 +1053,16 @@ def main():
     # Dataset
     parser.add_argument("--dataset-name-or-path", type=str, default="HuggingFaceFW/fineweb")
     parser.add_argument("--dataset-config", type=str, default=None)
+    parser.add_argument(
+        "--data-files",
+        type=str,
+        default=None,
+        help=(
+            "逗号分隔的数据文件（或 glob，如 'sample/10BT/*.parquet'）。"
+            "显式给出后 datasets 不再递归列整个仓库，冷缓存启动不会卡在 "
+            "list_repo_tree 上。"
+        ),
+    )
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument(
         "--dataset-cache-dir",
