@@ -360,6 +360,36 @@ def _install_httpx_timeouts(read_s: float = 30.0) -> None:
     httpx.Client._udtca_timeout_patched = True
 
 
+def _card_data_files(repo: str, config: str) -> Optional[str]:
+    """从数据集卡片里取该 config 的 data_files 通配符；取不到返回 None。
+
+    datasets 推断 builder 类型时只看卡片里**第一个** config（load.py 的
+    next(iter(configs))），fineweb 第一个是 default=data/*/*，于是每次冷启动
+    都要递归列两万多个文件。这里按用户真正请求的 config 取，只列一个小目录。
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        card = HfApi().dataset_info(repo).card_data or {}
+        for entry in card.get("configs") or []:
+            if entry.get("config_name") != config:
+                continue
+            files = entry.get("data_files")
+            if isinstance(files, str):
+                return files
+            for item in files or []:
+                if isinstance(item, str):
+                    return item
+                if isinstance(item, dict) and item.get("path"):
+                    return item["path"]
+    except Exception as exc:  # noqa: BLE001 - 拿不到就走原来的路径
+        print(
+            f"[dataset] 读卡片失败（{type(exc).__name__}: {exc}），按默认方式解析",
+            flush=True,
+        )
+    return None
+
+
 def _is_retryable(exc: BaseException) -> bool:
     """网络类错误才重试；配置写错、数据集不存在之类的直接抛。"""
     if isinstance(exc, (FileNotFoundError, ValueError, KeyError, NotImplementedError)):
@@ -412,6 +442,10 @@ def _materialize_token_cache(args, tokenizer, cache_path: Path) -> None:
         ds_kwargs["data_files"] = [
             item.strip() for item in args.data_files.split(",") if item.strip()
         ]
+    elif args.dataset_config:
+        pattern = _card_data_files(args.dataset_name_or_path, args.dataset_config)
+        if pattern:
+            ds_kwargs["data_files"] = pattern
 
     print(
         f"[dataset] resolve {args.dataset_name_or_path} "
