@@ -846,38 +846,56 @@ def partition_qwen_model(
 
 def build_qwen_model(cfg: TrainConfig, *, local_files_only: bool = False):
     """Build Qwen model with configuration from train_qwen.py."""
+    _rank = dist.get_rank() if dist.is_initialized() else -1
+
+    def _p(msg):
+        print(f"[init][rank={_rank}] {msg}", flush=True)
+
     attn_impl = "flash_attention_2" if cfg.use_flash_attn else None
     kwargs = {
         "torch_dtype": torch.bfloat16 if cfg.bf16 else (torch.float16 if cfg.fp16 else None),
         "attn_implementation": attn_impl,
         "trust_remote_code": True,
     }
+    _p(
+        f"build_qwen_model enter init_from_pretrained={cfg.init_from_pretrained} "
+        f"local_files_only={local_files_only} attn_impl={attn_impl}"
+    )
     if cfg.init_from_pretrained:
+        _p("from_pretrained start")
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name,
             local_files_only=local_files_only,
             **kwargs,
         )
+        _p("from_pretrained done")
     else:
+        _p("AutoConfig.from_pretrained start")
         config = AutoConfig.from_pretrained(
             cfg.model_name,
             trust_remote_code=True,
             local_files_only=local_files_only,
         )
+        _p(f"AutoConfig done num_hidden_layers={config.num_hidden_layers}")
         if attn_impl is not None:
             config._attn_implementation = attn_impl
+        _p("from_config(meta) start")
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(
                 config,
                 torch_dtype=kwargs["torch_dtype"],
                 trust_remote_code=True,
             )
+        _p("from_config(meta) done")
 
     if cfg.activation_checkpointing:
+        _p("gradient_checkpointing_enable start")
         # Disable KV cache for gradient checkpointing correctness.
         model.config.use_cache = False
         model.gradient_checkpointing_enable()
+        _p("gradient_checkpointing_enable done")
 
+    _p("build_qwen_model done")
     return model
 
 
@@ -1383,10 +1401,14 @@ def main():
     _pg_timeout_s = _watchdog_s + float(
         os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "21600")
     )
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
         init_method="env://",
         timeout=datetime.timedelta(seconds=_pg_timeout_s),
+        device_id=device,
     )
     world_size = dist.get_world_size()
     if dist.get_rank() == 0:
@@ -1422,9 +1444,6 @@ def main():
     dp_mesh = device_mesh["dp"]
     pp_mesh = device_mesh["pp"]
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
     print(
         "[qwen14b-process] "
         f"rank={dist.get_rank()} local_rank={local_rank} "
@@ -1439,7 +1458,9 @@ def main():
     # Enable TF32 for better performance
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    print(f"[init][rank={dist.get_rank()}] prepare_hf_cache start", flush=True)
     dataset_cache_path = _prepare_node_local_hf_cache(args)
+    print(f"[init][rank={dist.get_rank()}] prepare_hf_cache done", flush=True)
 
     # Create config object aligned with train_qwen.py
     cfg = TrainConfig(
@@ -1472,24 +1493,29 @@ def main():
     )
 
     # Build tokenizer
+    print(f"[init][rank={dist.get_rank()}] build_tokenizer start", flush=True)
     tokenizer = build_tokenizer(cfg, local_files_only=True)
+    print(f"[init][rank={dist.get_rank()}] build_tokenizer done", flush=True)
 
     # Build and partition Qwen model. Seed right before the build so every
     # rank (DP replicas included) starts from identical weights.
     _set_seed(args.seed)
     print(f"[seed] init seed={args.seed} rank={dist.get_rank()}", flush=True)
     model = build_qwen_model(cfg, local_files_only=True)
+    print(f"[init][rank={dist.get_rank()}] build_qwen_model returned", flush=True)
     stage_idx = pp_mesh.get_local_rank()
     tp_rank = device_mesh["tp"].get_local_rank() if tp_size > 1 else 0
     print(f"Stage index: {stage_idx} / {pp_size}; TP rank: {tp_rank} / {tp_size}")
     
     # Partition model for pipeline parallelism
+    print(f"[init][rank={dist.get_rank()}] partition start", flush=True)
     stage_model = partition_qwen_model(
         model,
         stage_idx,
         pp_size,
         debug_nan_steps=args.debug_nan_steps,
     )
+    print(f"[init][rank={dist.get_rank()}] partition done", flush=True)
     
     dp_rank = dp_mesh.get_local_rank()
     print(f"DP rank: {dp_rank} / {dp_size}")
@@ -1514,7 +1540,9 @@ def main():
             )
     
     # Get dataloader
+    print(f"[init][rank={dist.get_rank()}] dataloader start", flush=True)
     dataloader = get_dataloader(cfg, tokenizer, pp_size)
+    print(f"[init][rank={dist.get_rank()}] dataloader done", flush=True)
 
     def loss_fn(output, target):
         """LM loss function with padding mask."""
@@ -1526,6 +1554,7 @@ def main():
             debug=int(args.debug_nan_steps or 0) > 0,
         )
     
+    print(f"[init][rank={dist.get_rank()}] PolarParallel start", flush=True)
     trainer = PolarParallel(
         args=args,
         device_mesh=device_mesh,
@@ -1539,6 +1568,7 @@ def main():
         baseline_mode=args.baseline_mode,
     )
     trainer.lowbit_group = lowbit_group
+    print(f"[init][rank={dist.get_rank()}] PolarParallel done", flush=True)
 
     # 启动时打印每个 PG 是否可取消（只枚举，不 revoke）。
     if os.environ.get("UDTCA_REVOKE_PROBE", "1") != "0":
