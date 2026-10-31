@@ -406,9 +406,14 @@ def revoke_requested() -> bool:
     run decide to exit at step 0.
     """
     try:
-        path = _notice_path()
-        if not os.path.exists(path):
-            return False
+        return _is_fresh(_notice_path())
+    except Exception:
+        return False
+
+
+def _is_fresh(path: str) -> bool:
+    """True when ``path`` was written by（或就在）本进程启动之后。"""
+    try:
         return os.stat(path).st_mtime >= _PROCESS_START - 30.0
     except Exception:
         return False
@@ -419,13 +424,43 @@ def request_revoke(reason: str) -> None:
 
     Best effort and side-effect free on failure: if the file cannot be
     written the peers still find out through their own timeout.
+
+    A notice from an earlier run in the same rendezvous directory（固定
+    MASTER_PORT 时会复用）必须被覆盖，否则这次的真实原因永远写不进去——
+    2026-10-31 polar_dense 的失败原因就是这么丢的。
     """
     try:
         os.makedirs(_rendezvous_dir(), exist_ok=True)
-        if not os.path.exists(_notice_path()):
+        if not _is_fresh(_notice_path()):
             _write_atomic(_notice_path(), f"{reason}\npid={os.getpid()}\n")
     except Exception as exc:
         _log(f"cannot write revoke notice: {exc!r}")
+
+
+def _record_shutdown(rank: int, world: int, exit_code: int, reason: str) -> None:
+    """把收尾原因落盘，避免只靠 stdout/stderr（进程 os._exit 时会丢）。
+
+    每 rank 一个文件，不进 barrier；崩溃后直接 ``cat /tmp/udtca_revoke_*/rank-*.shutdown``
+    就能看到当时是谁、因为什么开始收尾。
+    """
+    try:
+        import traceback
+
+        os.makedirs(_rendezvous_dir(), exist_ok=True)
+        body = [
+            f"time={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}",
+            f"pid={os.getpid()} rank={rank}/{world} exit_code={exit_code}",
+            f"reason={reason}",
+        ]
+        if sys.exc_info()[0] is not None:
+            body.append("traceback:")
+            body.append(traceback.format_exc())
+        _write_atomic(
+            os.path.join(_rendezvous_dir(), f"rank-{rank}.shutdown"),
+            "\n".join(body) + "\n",
+        )
+    except Exception as exc:
+        _log(f"cannot record shutdown reason: {exc!r}")
 
 
 def _flush_logs() -> None:
@@ -492,6 +527,7 @@ def coordinated_shutdown(
     _log(
         f"coordinated shutdown rank={rank}/{world} code={exit_code}: {reason}"
     )
+    _record_shutdown(rank, world, exit_code, reason)
     request_revoke(reason)
 
     try:
