@@ -27,75 +27,6 @@ Experiment entrypoint for udtca/experiments/qwen14b.
 """
 
 
-def _auto_shutdown(reason: str, exit_code: int) -> None:
-    """Roll the job back in-process: revoke every comm, exit once quiescent.
-
-    Nothing is signalled to the other ranks; the handshake is a per-node file
-    barrier, because exiting while a peer still has a collective in flight is
-    what corrupts the GPU VA space (XID 24).
-    """
-    try:
-        _revoke_dir = os.environ.get(
-            "UDTCA_REVOKE_PY_DIR", str(Path(__file__).resolve().parent)
-        )
-        if _revoke_dir not in sys.path:
-            sys.path.insert(0, _revoke_dir)
-        from nccl_revoke import coordinated_shutdown
-
-        coordinated_shutdown(
-            reason,
-            exit_code=exit_code,
-            device_index=int(os.environ.get("LOCAL_RANK", "0")),
-            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "10")),
-        )
-    except Exception as exc:
-        # Without a coordinated rollback, exiting could wedge the peers.
-        print(f"[auto-shutdown] unavailable: {exc!r}", flush=True)
-
-
-def _install_auto_shutdown() -> None:
-    """Make faults end in an orderly self-exit instead of an external kill.
-
-    - SIGTERM/SIGINT (torchrun stopping siblings, Ctrl-C): revoke first, so
-      the teardown can no longer interrupt an in-flight collective.
-    - uncaught exceptions (main or worker thread): same path.
-
-    Both are safety nets for faults that surface in Python. A hang inside NCCL
-    is caught by the comm watchdog in the training loop, which runs on its own
-    thread and is not subject to GIL-bound signal delivery.
-    """
-
-    def _on_signal(signum, frame):
-        name = _signal.Signals(signum).name if signum in _signal.Signals._value2member_map_ else str(signum)
-        _auto_shutdown(f"signal {signum} ({name})", 128 + signum)
-
-    for _sig in (_signal.SIGTERM, _signal.SIGINT):
-        try:
-            _signal.signal(_sig, _on_signal)
-        except Exception:
-            pass
-
-    _orig_excepthook = sys.excepthook
-
-    def _excepthook(exc_type, exc, tb):
-        _orig_excepthook(exc_type, exc, tb)
-        _auto_shutdown(f"uncaught {exc_type.__name__}: {exc}", 1)
-
-    sys.excepthook = _excepthook
-
-    import threading
-
-    def _thread_excepthook(args):
-        print(
-            f"[auto-shutdown] uncaught in thread {args.thread.name}: "
-            f"{args.exc_value!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-        _auto_shutdown(f"thread {args.thread.name}: {args.exc_value!r}", 1)
-
-    threading.excepthook = _thread_excepthook
-
 from psgd.parallelism.polar.wrapper import PolarParallel
 
 import torch
@@ -136,8 +67,8 @@ def create_lowbit_dp_group(dp_group):
     dist.all_gather_object(gathered, my_ranks)
     dp_rank_groups = sorted({tuple(int(r) for r in ranks) for ranks in gathered})
 
-    # 看门狗只 revoke、不退出；PG timeout 设得远大于看门狗，避免 torch
-    # 自己在超时后 abort comm / 退出进程（那会触发 torchrun SIGTERM -> XID 24）。
+    # PG timeout 设得很大：卡住时由外部 kill 处理，不让 torch 自己超时
+    # abort comm / 退出进程（那会触发 torchrun SIGTERM -> XID 24）。
     _lb_watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300"))
     _lb_pg_timeout = datetime.timedelta(
         seconds=_lb_watchdog_s
@@ -1008,15 +939,6 @@ def shutdown_distributed() -> None:
     if not dist.is_available() or not dist.is_initialized():
         return
     try:
-        from nccl_revoke import exit_now, revoke_requested
-    except Exception:
-        exit_now = None
-        revoke_requested = None
-    if revoke_requested is not None and revoke_requested():
-        # A watchdog already revoked the comms; destroying them now would race
-        # the rollback. Join it and let it exit the process.
-        exit_now(3)
-    try:
         rank = dist.get_rank()
     except Exception:
         rank = -1
@@ -1395,8 +1317,8 @@ def main():
         bitscom_module.init(bitwidth=args.bitwidth)
     
     # Initialize distributed
-    # 看门狗只 revoke、不退出，PG timeout 因此设得远大于它：进程绝不因
-    # torch 自己的 timeout 而退出（退出会让 torchrun SIGTERM 同伴 -> XID 24）。
+    # PG timeout 设得很大：进程不因 torch 自己的 timeout 退出
+    # （退出会让 torchrun SIGTERM 同伴 -> XID 24），卡住时由外部 kill 处理。
     _watchdog_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300"))
     _pg_timeout_s = _watchdog_s + float(
         os.environ.get("UDTCA_PG_TIMEOUT_MARGIN_S", "21600")
@@ -1570,23 +1492,6 @@ def main():
     trainer.lowbit_group = lowbit_group
     print(f"[init][rank={dist.get_rank()}] PolarParallel done", flush=True)
 
-    # 启动时打印每个 PG 是否可取消（只枚举，不 revoke）。
-    if os.environ.get("UDTCA_REVOKE_PROBE", "1") != "0":
-        try:
-            from nccl_revoke import _nccl_comms, revoke_summary
-
-            _probe = _nccl_comms(int(os.environ.get("LOCAL_RANK", "0")))
-            _cancelable = sum(1 for e in _probe if len(e) > 2 and e[2])
-            _ptr = sum(1 for e in _probe if not (len(e) > 2 and e[2]))
-            print(
-                f"[revoke-probe] rank={dist.get_rank()} "
-                f"groups={revoke_summary().get('groups', 0)} "
-                f"cancelable={len(_probe)} (ptr={_ptr}, backend-abort={_cancelable})",
-                flush=True,
-            )
-        except Exception as _probe_exc:
-            print(f"[revoke-probe] unavailable: {_probe_exc!r}", flush=True)
-
     trainer.train()
     # Ordered teardown: subgroups first, world last. Destroying world first
     # leaves the remaining mesh PGs to be aborted by destructors, which is
@@ -1598,18 +1503,12 @@ def main():
     # 所有 ProcessGroup 已显式销毁，直接跳过析构退出。
     # 需要排查退出路径时设 UDTCA_FAST_EXIT=0。
     if os.environ.get("UDTCA_FAST_EXIT", "1") == "1":
-        try:
-            from nccl_revoke import exit_now
-        except Exception:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
-        # No-op unless a rollback is in progress; then it waits for the node.
-        exit_now(0)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
     from dataclasses import dataclass
 
-    _install_auto_shutdown()
     main()
