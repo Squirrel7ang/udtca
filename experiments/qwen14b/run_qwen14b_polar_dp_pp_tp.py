@@ -627,9 +627,17 @@ def partition_qwen_model(
     def layer_attention_mask(attention_mask):
         if attention_mask is None:
             return None
-        if attention_mask.dim() == 2 and bool(attention_mask.all().item()):
-            return None
-        return attention_mask
+        if attention_mask.dim() != 2:
+            return attention_mask
+        # 全 1 判定由 trainer 在 CPU 侧算好、挂在 stage 模块上（见
+        # PolarParallel._stage_attention_mask）：对设备上的 mask 做
+        # `bool(mask.all().item())` 每个 microbatch、每个 stage 都要全卡同步一次，
+        # 会把 PP 的 1F1B overlap 打散。这里只读标志，不再碰设备。
+        all_ones = getattr(model, "_udtca_mask_all_ones", None)
+        if all_ones is None:
+            # 兜底：没经过 polar trainer 的直调（例如单机手写 forward）
+            all_ones = bool(attention_mask.all().item())
+        return None if all_ones else attention_mask
     
     # Custom forward method for partitioned model with proper RoPE handling
     def custom_forward(input_ids_or_hidden, attention_mask=None):
@@ -1095,6 +1103,13 @@ def main():
         default=False,
         help="Disable torch profiler trace generation.",
     )
+    parser.add_argument(
+        "--profiler-start-step",
+        type=int,
+        default=1,
+        help="Enter the torch profiler only after this many steps have run "
+        "(0-based batch index). wait/warmup/active count from here.",
+    )
     parser.add_argument("--profiler-wait-steps", type=int, default=1)
     parser.add_argument("--profiler-warmup-steps", type=int, default=1)
     parser.add_argument(
@@ -1297,6 +1312,8 @@ def main():
         raise ValueError("--polar-bucket-numel must be positive")
     if args.polar_max_inflight_buckets <= 0:
         raise ValueError("--polar-max-inflight-buckets must be positive")
+    if args.profiler_start_step < 0:
+        raise ValueError("--profiler-start-step must be non-negative")
     if args.profiler_wait_steps < 0:
         raise ValueError("--profiler-wait-steps must be non-negative")
     if args.profiler_warmup_steps < 0:
