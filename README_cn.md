@@ -372,7 +372,28 @@ tc qdisc del dev ens1f0 root
 > - 跑完记得 `tc qdisc del`，否则会给共享机器留一条限速规则。
 > - 不限速时两机之间就是交换机给的理论带宽 **12.5 Gb/s**。
 
-### 2.5 QwenVL8B：同一套流程的多模态版本
+### 2.5 Qwen3B：同一套流程的小模型版本
+
+`experiments/qwen3b/` 是 `experiments/qwen14b/` 的同构副本，模型换成
+`Qwen/Qwen2.5-3B-Instruct`（36 层、16 个 attention 头 / 2 个 KV 头），
+默认拓扑仍是 **PP=8 / TP=2 / DP=2**，端口与 14B 错开（29520/29521）。
+用途：同一套 PP/TP/DP 代码、同一个编排流程，用更小的模型把对照实验跑快，
+先在**不同卡数/并行度**上扫结果，再回 14B 复验。
+
+```bash
+# 编排行（生成脚本 → 下发 → 起训 → 收日志）
+python udtca-config/qwen3b/generate_and_run.py --only 1 --runtime-log off
+
+# 跨机容器版（powerone1 宿主机上跑），卡数/并行度随便调
+python3 udtca-config/qwen3b/run_docker.py --modes mixed --max-steps 5
+python3 udtca-config/qwen3b/run_docker.py --modes baseline,mixed --gpus 8 --pp 4 --tp 2
+```
+
+两条 3B 特有的约束（入口脚本会校验）：**TP 只能取 1 或 2**（KV 头只有 2 个），
+**PP 不要求整除 36 层**（pp=8 时前 4 个 stage 各 5 层、后 4 个各 4 层）。
+细节见 [Qwen3B README](experiments/qwen3b/README.md)。
+
+### 2.6 QwenVL8B：同一套流程的多模态版本
 
 `experiments/qwenvl8b/` 是照着 Qwen14B 搭的 Qwen3-VL 版本，
 模型是 `Qwen/Qwen3-VL-8B-Instruct`，拓扑 **PP=8 / TP=1 / DP=4**：
