@@ -1019,6 +1019,72 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def save_stage_weights(
+    model,
+    save_dir: str,
+    *,
+    step: int,
+    pp_stage: int,
+    pp_size: int,
+    tp_rank: int,
+    tp_size: int,
+    run_label: str = "",
+) -> str:
+    """Save this rank's pipeline-stage weights as a single shard file.
+
+    Call only on ranks with dp_rank == 0: DP replicas hold identical weights,
+    so writing them once avoids Nx duplicate files on disk.
+
+    Memory: parameters are copied out one at a time as
+    `detach() -> (DTensor) to_local() -> cpu(copy=True)`, so the GPU never
+    holds an extra full-stage copy (only a transient per-parameter transfer),
+    and no all-gather is done. CPU peak is roughly this stage's own weights
+    (14B / pp_size / tp_size, ~1.7 GB in bf16 at PP=8, TP=2).
+
+    Layout: <save_dir>/<run_label>/ppXX_tpYY/step_XXXXXX.pt
+    """
+    out_dir = Path(save_dir) / (run_label or "default") / f"pp{pp_stage:02d}_tp{tp_rank:02d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    state_dict, meta = {}, {}
+
+    def _to_cpu_host(t):
+        info = {"dtype": str(t.dtype), "global_shape": list(t.shape)}
+        if hasattr(t, "to_local"):       # DTensor: keep this rank's shard only
+            info["placements"] = [str(p) for p in t.placements]
+            t = t.to_local()
+        return t.to("cpu", copy=True), info
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            state_dict[name], meta[name] = _to_cpu_host(param.detach())
+        for name, buf in model.named_buffers():
+            if buf is None:
+                continue
+            state_dict[name], meta[name] = _to_cpu_host(buf.detach())
+
+    payload = {
+        "step": int(step),
+        "pp_stage": pp_stage, "pp_size": pp_size,
+        "tp_rank": tp_rank, "tp_size": tp_size,
+        "run_label": run_label,
+        "world_rank": dist.get_rank(),
+        "state_dict": state_dict,
+        "meta": meta,
+    }
+    path = out_dir / f"step_{int(step):06d}.pt"
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)            # tmp + rename: 中断不会留下半个文件
+    os.replace(tmp, path)
+    size_mib = path.stat().st_size / (1024 ** 2)
+    print(
+        f"[save][rank={dist.get_rank()}] pp={pp_stage}/{pp_size} tp={tp_rank}/{tp_size} "
+        f"-> {path} ({size_mib:.0f} MiB)", flush=True,
+    )
+    del state_dict, payload
+    return str(path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polar-SGD pretraining for Qwen2.5 models")
     
@@ -1084,7 +1150,25 @@ def main():
     # Logging and saving
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=1000)
-    parser.add_argument("--save-dir", type=str, default="checkpoints/qwen2_5_14b_instruct")
+    parser.add_argument(
+        "--save-weights",
+        action="store_true",
+        default=False,
+        help=(
+            "训练结束后把本 rank 的流水线 stage 权重落盘（只在 dp_rank 0 上写，"
+            "每个 (pp_stage, tp_rank) 一个分片文件）。默认关闭。"
+        ),
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="checkpoints/qwen2_5_14b_instruct",
+        help=(
+            "权重保存根目录（配合 --save-weights）。实际路径 "
+            "<save-dir>/<run-label>/ppXX_tpYY/step_XXXXXX.pt；"
+            "不参与模型加载（加载看 --model-name）。"
+        ),
+    )
     parser.add_argument("--run-label", type=str, default="")
     parser.add_argument(
         "--step-log-dir",
@@ -1510,6 +1594,36 @@ def main():
     print(f"[init][rank={dist.get_rank()}] PolarParallel done", flush=True)
 
     trainer.train()
+
+    save_failed = False
+    if args.save_weights:
+        if dp_rank == 0:
+            # 每个 (pp_stage, tp_rank) 只由 dp_rank 0 写一份；另一份 DP 副本权重相同。
+            # 保存期间没有集合通信，其他 rank 会在 shutdown_distributed() 的 barrier 处等。
+            # 失败也走到收尾（否则先退的 rank 会让其余 rank 卡在 barrier），
+            # 最后用退出码 3 标出来。
+            try:
+                save_stage_weights(
+                    trainer.stage_model,
+                    args.save_dir,
+                    step=args.max_steps,
+                    pp_stage=stage_idx,
+                    pp_size=pp_size,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    run_label=args.run_label,
+                )
+                torch.cuda.empty_cache()
+            except Exception as exc:      # noqa: BLE001
+                save_failed = True
+                print(f"[save][rank={dist.get_rank()}] FAILED: {exc!r}", flush=True)
+        else:
+            print(
+                f"[save][rank={dist.get_rank()}] dp_rank={dp_rank}, skip "
+                "(同一份权重由 dp_rank 0 写)",
+                flush=True,
+            )
+
     # Ordered teardown: subgroups first, world last. Destroying world first
     # leaves the remaining mesh PGs to be aborted by destructors, which is
     # exactly the path that corrupts Corex device VA space.
@@ -1522,7 +1636,7 @@ def main():
     if os.environ.get("UDTCA_FAST_EXIT", "1") == "1":
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(0)
+        os._exit(3 if save_failed else 0)
 
 
 if __name__ == "__main__":
